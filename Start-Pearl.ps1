@@ -738,7 +738,16 @@ function Invoke-SelfUpdate {
         if ($ParentPid -gt 0) { Wait-Process -Id $ParentPid -Timeout 15 -ErrorAction SilentlyContinue }
         $new = Join-Path ([IO.Path]::GetTempPath()) ('pearl-update-' + [guid]::NewGuid().ToString('N') + '.ps1')
         $fetch = $UpdateUrl
-        if ($fetch -like 'https://*') { $fetch += '?t=' + [DateTime]::UtcNow.Ticks }   # bypass the raw-file CDN cache
+        if ($UpdateUrl -match '^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/main/(.+)$') {
+            # The raw CDN caches 'main' for ~5 minutes and ignores query strings, so a fresh push can look missing.
+            # Resolve the newest commit and fetch that exact version instead.
+            $owner = $Matches[1]; $repo = $Matches[2]; $path = $Matches[3]
+            try {
+                $sha = ([string](Invoke-RestMethod -Uri "https://api.github.com/repos/$owner/$repo/commits/main" -TimeoutSec 20 `
+                    -Headers @{ Accept='application/vnd.github.sha'; 'User-Agent'='pearl-updater' })).Trim()
+                if ($sha -match '^[0-9a-f]{40}$') { $fetch = "https://raw.githubusercontent.com/$owner/$repo/$sha/$path" }
+            } catch { Write-Host 'Could not resolve the latest commit; using the cached main branch (may be up to 5 minutes old).' -ForegroundColor Yellow }
+        }
         Write-Host "Downloading $UpdateUrl ..."
         try { Invoke-WebRequest -Uri $fetch -OutFile $new -UseBasicParsing -TimeoutSec 60 }
         catch { throw "Download failed: $($_.Exception.Message) (a private repository returns 404)" }
