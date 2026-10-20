@@ -2,10 +2,10 @@
 <# Pearl-POW / PRL, one RTX 4090 per Windows 11 PC.
    Interactive menu: start/stop the miner, live summary, optional Windows startup.
    The miner runs in its own console window; closing this menu never stops it.
-   Nothing starts automatically unless you enable option 5.
+   Nothing starts automatically unless you enable option 6.
    Downloads KRig 1.5.9 from its publisher and verifies the pinned SHA-256.
    Does not change GPU tuning, antivirus, firewall, or power settings.
-   Options 4/5 create (or remove) one shortcut in your per-user Startup folder.
+   Options 5/6 create (or remove) one shortcut in your per-user Startup folder.
 #>
 [CmdletBinding()]
 param(
@@ -106,7 +106,7 @@ function Install-Miner {
     return $exe
 }
 
-function Start-Miner {
+function Start-Miner([string]$StartMode) {
     if (Get-Process -Name krig-miner -ErrorAction SilentlyContinue) {
         Write-Host 'Miner is already running.' -ForegroundColor Yellow
         return
@@ -127,7 +127,8 @@ function Start-Miner {
     if ($user -notmatch '^krx[A-Za-z0-9]+$') {
         throw 'Expected your Kryptex Mining Username beginning krx. Do not include solo:, a worker suffix, password or wallet address.'
     }
-    $m = $Mode
+    $m = $StartMode
+    if (-not $m) { $m = $Mode }
     if (-not $m) { $m = [string]$script:cfg.mode }
     $m = $m.ToUpperInvariant()
     if ($m -eq 'PPS+') { $m = 'PPS' }
@@ -164,7 +165,7 @@ function Start-Miner {
         elevated=$script:isAdmin} |
         ConvertTo-Json | Set-Content (Join-Path $logDir 'session.json') -Encoding UTF8
     # ArgumentList is joined by Start-Process on Windows; only path needs quotes.
-    # The HTTP API binds to 127.0.0.1 only and feeds the live summary (option 3).
+    # The HTTP API binds to 127.0.0.1 only and feeds the live summary (option 4).
     $argsList = @('--coin','pearl','--url',$pool,'--user',$login,'--no-rocm','--no-tui',
                   '--log-level',$LogLevel,'--log-file',('"' + $nativeLog + '"'),
                   '--api-port',[string]$script:cfg.api_port,'--api-host','127.0.0.1')
@@ -204,6 +205,16 @@ function Stop-Miner {
         }
         Write-Host 'Miner stopped.' -ForegroundColor Green
     }
+}
+
+function Start-MinerInMode([string]$StartMode) {
+    if (Get-Process -Name krig-miner -ErrorAction SilentlyContinue) {
+        $answer = (Read-Host "Miner is already running. Stop it and restart in $StartMode mode? (y/N)").Trim()
+        if ($answer -ne 'y') { Write-Host 'Left running unchanged.'; return }
+        Stop-Miner
+        Get-Process -Name krig-miner -ErrorAction SilentlyContinue | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
+    }
+    Start-Miner $StartMode
 }
 
 function Show-Summary {
@@ -260,7 +271,7 @@ function Show-Summary {
                     Write-Host ('Estimated earnings: {0:N8} BTC/day | {1:N0} sat/day | {2:N0} sat/hour' -f $btcDay,($btcDay*1e8),($btcDay*1e8/24))
                     if ($watts -gt 0) { Write-Host ('Estimated revenue: {0:N0} sat/kWh (GPU power only)' -f (($btcDay*1e8)/($watts*24/1000))) }
                 } else {
-                    Write-Host 'Earnings: set your BTC per TH/s per day in menu option 6 to get an estimate.' -ForegroundColor Yellow
+                    Write-Host 'Earnings: set your BTC per TH/s per day in menu option 7 to get an estimate.' -ForegroundColor Yellow
                 }
                 if ($watts -gt 0) { Write-Host ('Efficiency: {0:N4} TH/s per W' -f ($th/$watts)) }
             } else {
@@ -709,6 +720,34 @@ function Show-GpuSettings {
     }
 }
 
+function Get-PendingComputerName {
+    try { return [string](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -ErrorAction Stop).ComputerName }
+    catch { return $env:COMPUTERNAME }
+}
+
+function Set-PcName {
+    $active = $env:COMPUTERNAME
+    $pending = Get-PendingComputerName
+    Write-Host "This PC is named: $active" -ForegroundColor White
+    if ($pending -ne $active) { Write-Host "Already renamed to $pending; takes effect after a reboot." -ForegroundColor Yellow }
+    Write-Host 'The default worker name is built from this name, so every PC needs its own.'
+    $n = (Read-Host 'New PC name (1-15 letters, numbers or hyphens; Enter = cancel)').Trim()
+    if (-not $n) { Write-Host 'Cancelled.'; return }
+    if ($n -notmatch '^[A-Za-z0-9-]{1,15}$' -or $n -match '^[0-9]+$' -or $n.StartsWith('-') -or $n.EndsWith('-')) {
+        throw 'Invalid name. Use 1-15 letters, numbers or hyphens, not only digits, no leading or trailing hyphen. Nothing changed.'
+    }
+    if ($n -ieq $pending) { Write-Host 'That is already the (pending) name. Nothing changed.'; return }
+    # Renaming needs administrator rights: only this one command is elevated. $n is validated above.
+    $cmd = "try { Rename-Computer -NewName '$n' -Force -ErrorAction Stop; exit 0 } catch { exit 1 }"
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+    Write-Host 'Approve the Windows prompt to rename this PC.' -ForegroundColor Yellow
+    $p = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+        -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand',$enc) -Verb RunAs -Wait -PassThru -WindowStyle Hidden
+    if ($p.ExitCode -ne 0) { throw 'Rename failed (declined prompt, domain-joined PC, or invalid name). Nothing changed.' }
+    Write-Host "PC renamed to $n. Reboot Windows to apply it." -ForegroundColor Green
+    Write-Host 'After the reboot, restart the miner so the worker name uses the new PC name.'
+}
+
 function Install-ToDocuments {
     if (-not $scriptPath) { throw 'Cannot copy: save this script to a .ps1 file and run it from there.' }
     $dest = Join-Path ([Environment]::GetFolderPath('MyDocuments')) '1_pearl_miner'
@@ -721,7 +760,7 @@ function Install-ToDocuments {
     Set-Content (Join-Path $dest 'Start-Pearl.cmd') -Encoding ASCII -Value "@echo off`r`n$ps %*`r`npause`r`n"
     Set-Content (Join-Path $dest 'Stop-Pearl.cmd') -Encoding ASCII -Value "@echo off`r`n$ps -Stop %*`r`npause`r`n"
     Write-Host "Copied to: $dest" -ForegroundColor Green
-    Write-Host 'Run Start-Pearl.cmd from there. If Windows startup (option 4) was enabled from another folder,'
+    Write-Host 'Run Start-Pearl.cmd from there. If Windows startup (option 5) was enabled from another folder,'
     Write-Host 'turn it off and on again from the new copy so the shortcut points at it.'
 }
 
@@ -812,16 +851,23 @@ function Show-Menu {
         $su = 'OFF'; $suColor = 'DarkGray'; if ($script:cfg.startup) { $su = 'ON'; $suColor = 'Green' }
         $as = 'OFF'; $asColor = 'DarkGray'; if ($script:cfg.autostart) { $as = 'ON'; $asColor = 'Green' }
         $elTag = 'not admin'; $elColor = 'DarkYellow'; if ($script:isAdmin) { $elTag = 'ACTIVE'; $elColor = 'Green' }
+        $pcTag = $env:COMPUTERNAME; $pcTagColor = 'DarkGray'
+        $pendingName = Get-PendingComputerName
+        if ($pendingName -ne $env:COMPUTERNAME) { $pcTag = "$($env:COMPUTERNAME) -> $pendingName"; $pcTagColor = 'Yellow' }
+        $ppsTag = ''; $soloTag = ''
+        if ($script:cfg.mode -eq 'SOLO') { $soloTag = 'last used' } else { $ppsTag = 'last used' }
         $items = @(
-            New-MenuItem '1' 'Start miner'
-            New-MenuItem '2' 'Stop miner'
-            New-MenuItem '3' 'Live TH/s and earnings summary'
-            New-MenuItem '4' 'Start this menu with Windows' $su $suColor
-            New-MenuItem '5' 'Auto-start mining after restart' $as $asColor
-            New-MenuItem '6' 'Earnings yield (BTC per TH/s/day)' ([string]$script:cfg.btc_per_th_day) 'Yellow'
-            New-MenuItem '7' 'Put in Documents (1_pearl_miner)'
+            New-MenuItem '1' 'Start PPS mining' $ppsTag 'DarkGray'
+            New-MenuItem '2' 'Start SOLO mining' $soloTag 'DarkGray'
+            New-MenuItem '3' 'Stop miner'
+            New-MenuItem '4' 'Live TH/s and earnings summary'
+            New-MenuItem '5' 'Start this menu with Windows' $su $suColor
+            New-MenuItem '6' 'Auto-start mining after restart' $as $asColor
+            New-MenuItem '7' 'Earnings yield (BTC per TH/s/day)' ([string]$script:cfg.btc_per_th_day) 'Yellow'
             New-MenuItem '8' 'GPU settings (power, clock offsets)'
             New-MenuItem '9' 'Update script from GitHub'
+            New-MenuItem 'N' 'Rename this PC (needs reboot)' $pcTag $pcTagColor
+            New-MenuItem 'D' 'Put in Documents (1_pearl_miner)'
             New-MenuItem 'E' 'Elevate (restart as administrator)' $elTag $elColor
             New-MenuItem '0' 'Exit menu (miner keeps running)'
         )
@@ -830,10 +876,11 @@ function Show-Menu {
         $pause = $true
         try {
             switch ($c) {
-                '1' { Start-Miner }
-                '2' { Stop-Miner }
-                '3' { Show-Summary; $pause = $false }
-                '4' {
+                '1' { Start-MinerInMode 'PPS' }
+                '2' { Start-MinerInMode 'SOLO' }
+                '3' { Stop-Miner }
+                '4' { Show-Summary; $pause = $false }
+                '5' {
                     $new = -not [bool]$script:cfg.startup
                     Set-StartupHook $new
                     $script:cfg.startup = $new
@@ -842,7 +889,7 @@ function Show-Menu {
                     Write-Host ('Windows startup: {0}' -f $(if ($new) { 'ON' } else { 'OFF' }))
                     if (-not $new) { Write-Host 'Auto-start mining was also turned OFF.' }
                 }
-                '5' {
+                '6' {
                     $new = -not [bool]$script:cfg.autostart
                     if ($new -and -not $script:cfg.startup) {
                         Set-StartupHook $true
@@ -853,16 +900,17 @@ function Show-Menu {
                     Save-Config
                     Write-Host ('Auto-start mining after restart: {0}' -f $(if ($new) { 'ON' } else { 'OFF' }))
                 }
-                '6' {
+                '7' {
                     $v = (Read-Host 'BTC per TH/s per day (e.g. 0.0000001, 0 to clear)').Trim().Replace(',','.')
                     $d = 0.0
                     if ([double]::TryParse($v,[Globalization.NumberStyles]::Float,[Globalization.CultureInfo]::InvariantCulture,[ref]$d) -and $d -ge 0 -and $d -le 1000) {
                         $script:cfg.btc_per_th_day = $d; Save-Config; Write-Host 'Saved.'
                     } else { Write-Host 'Invalid number.' -ForegroundColor Red }
                 }
-                '7' { Install-ToDocuments }
                 '8' { Show-GpuSettings; $pause = $false }
                 '9' { Start-SelfUpdate; Start-Sleep -Seconds 1; return }
+                'N' { Set-PcName }
+                'D' { Install-ToDocuments }
                 'E' { if (Start-Elevated) { Start-Sleep -Seconds 1; return } }
                 '0' { return }
                 default { Write-Host 'Invalid choice.' -ForegroundColor Red }
