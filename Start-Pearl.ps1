@@ -41,7 +41,7 @@ $script:isAdmin = $false
 
 function Get-Config {
     $c = [ordered]@{ mining_username=''; mode='PPS'; startup=$false; autostart=$false; btc_per_th_day=0.0; api_port=12000; core_offset=0; mem_offset=0
-           core_min=-500; core_max=300; mem_min=-1000; mem_max=1500
+           core_min=-500; core_max=300; mem_min=-1000; mem_max=1500; worker_suffix=''
            fan_mode='auto'; fan_percent=60; fan_curve='50:35,60:50,70:65,75:75,80:90,85:100' }
     if (Test-Path $configFile) {
         $saved = Get-Content $configFile -Raw | ConvertFrom-Json
@@ -106,6 +106,14 @@ function Install-Miner {
     return $exe
 }
 
+# Default worker = mode + PC name + saved suffix. Kryptex allows 32 Latin letters/numbers; the suffix is kept, the PC name is trimmed.
+function Get-DefaultWorker([string]$m) {
+    $sfx = [string]$script:cfg.worker_suffix
+    $base = $m.ToLowerInvariant() + ($env:COMPUTERNAME -replace '[^A-Za-z0-9]','')
+    if ($base.Length + $sfx.Length -gt 32) { $base = $base.Substring(0, 32 - $sfx.Length) }
+    return $base + $sfx
+}
+
 function Start-Miner([string]$StartMode) {
     if (Get-Process -Name krig-miner -ErrorAction SilentlyContinue) {
         Write-Host 'Miner is already running.' -ForegroundColor Yellow
@@ -134,10 +142,7 @@ function Start-Miner([string]$StartMode) {
     if ($m -eq 'PPS+') { $m = 'PPS' }
     if ($m -notin @('PPS','SOLO')) { throw 'Invalid saved mode. Supply -Mode PPS or -Mode SOLO.' }
     $w = $Worker
-    if (-not $w) {
-        $w = $m.ToLowerInvariant() + ($env:COMPUTERNAME -replace '[^A-Za-z0-9]','')
-        if ($w.Length -gt 32) { $w = $w.Substring(0,32) }
-    }
+    if (-not $w) { $w = Get-DefaultWorker $m }
     if ($w -notmatch '^[A-Za-z0-9]{1,32}$') { throw 'Worker must contain 1-32 letters or numbers.' }
     if ($RunLabel -notmatch '^[A-Za-z0-9_-]{1,64}$') { throw 'RunLabel must contain 1-64 letters, numbers, underscores or hyphens.' }
     $script:cfg.mining_username = $user
@@ -720,6 +725,28 @@ function Show-GpuSettings {
     }
 }
 
+function Set-WorkerSuffix {
+    $cur = [string]$script:cfg.worker_suffix
+    $mode = [string]$script:cfg.mode
+    Write-Host "Current suffix: '$cur' | Worker for $mode mode: $(Get-DefaultWorker $mode)" -ForegroundColor White
+    Write-Host 'The suffix is added to the end of the default worker name (mode + PC name), so PCs with the same name get different workers.'
+    $n = (Read-Host 'New suffix (1-12 letters/numbers, e.g. a or rig2; type - to clear; Enter = cancel)').Trim()
+    if (-not $n) { Write-Host 'Cancelled.'; return }
+    if ($n -eq '-') { $n = '' }
+    elseif ($n -notmatch '^[A-Za-z0-9]{1,12}$') { throw 'Invalid suffix. Use 1-12 letters or numbers, no spaces or symbols. Nothing changed.' }
+    $script:cfg.worker_suffix = $n
+    Save-Config
+    Write-Host "Saved. Worker for $mode mode will be: $(Get-DefaultWorker $mode)" -ForegroundColor Green
+    if ($Worker) { Write-Host 'Note: this run was started with -Worker, which overrides the suffix for this session only.' -ForegroundColor Yellow }
+    if (-not (Get-Process -Name krig-miner -ErrorAction SilentlyContinue)) { Write-Host 'It applies the next time the miner starts.'; return }
+    if ((Read-Host 'The running miner still uses the old worker name. Restart it now to apply? (y/N)').Trim() -ne 'y') {
+        Write-Host 'Not restarted. The new worker name applies on the next miner start.'; return
+    }
+    Stop-Miner
+    Get-Process -Name krig-miner -ErrorAction SilentlyContinue | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
+    Start-Miner
+}
+
 function Get-PendingComputerName {
     try { return [string](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -ErrorAction Stop).ComputerName }
     catch { return $env:COMPUTERNAME }
@@ -854,6 +881,7 @@ function Show-Menu {
         $pcTag = $env:COMPUTERNAME; $pcTagColor = 'DarkGray'
         $pendingName = Get-PendingComputerName
         if ($pendingName -ne $env:COMPUTERNAME) { $pcTag = "$($env:COMPUTERNAME) -> $pendingName"; $pcTagColor = 'Yellow' }
+        $wkSfx = [string]$script:cfg.worker_suffix; if (-not $wkSfx) { $wkSfx = 'none' }
         $ppsTag = ''; $soloTag = ''
         if ($script:cfg.mode -eq 'SOLO') { $soloTag = 'last used' } else { $ppsTag = 'last used' }
         $items = @(
@@ -866,6 +894,7 @@ function Show-Menu {
             New-MenuItem '7' 'Earnings yield (BTC per TH/s/day)' ([string]$script:cfg.btc_per_th_day) 'Yellow'
             New-MenuItem '8' 'GPU settings (power, clock offsets)'
             New-MenuItem '9' 'Update script from GitHub'
+            New-MenuItem 'W' 'Worker name suffix' $wkSfx 'Yellow'
             New-MenuItem 'N' 'Rename this PC (needs reboot)' $pcTag $pcTagColor
             New-MenuItem 'D' 'Put in Documents (1_pearl_miner)'
             New-MenuItem 'E' 'Elevate (restart as administrator)' $elTag $elColor
@@ -909,6 +938,7 @@ function Show-Menu {
                 }
                 '8' { Show-GpuSettings; $pause = $false }
                 '9' { Start-SelfUpdate; Start-Sleep -Seconds 1; return }
+                'W' { Set-WorkerSuffix }
                 'N' { Set-PcName }
                 'D' { Install-ToDocuments }
                 'E' { if (Start-Elevated) { Start-Sleep -Seconds 1; return } }

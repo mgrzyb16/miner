@@ -23,6 +23,7 @@ Set your payout address in your Kryptex account; the script never handles wallet
 | 7 | Earnings yield | Your BTC per TH/s per day. The miner API reports hashrate but not earnings, so the BTC estimate is hashrate x this number. Until set, the summary says so. Real balance is in the Kryptex dashboard. |
 | 8 | GPU settings | Power limit and clock offsets (see below). |
 | 9 | Update script from GitHub | Opens an updater window, replaces the script, restarts the menu (see below). |
+| W | Worker name suffix | Text added to the end of the default worker name (`pps`/`solo` + PC name + suffix), 1-12 letters or numbers, `-` clears it. Use it to split PCs that share a name without renaming Windows. Offers to restart a running miner so the new worker name takes effect. Kryptex worker names are Latin letters and numbers, max 32 characters; the PC name is trimmed to fit the suffix. An explicit `-Worker` overrides it. |
 | N | Rename this PC | Asks for a new Windows computer name (1-15 letters, numbers or hyphens) and renames the PC after a Windows administrator prompt. Only that one command is elevated. Reboot yourself afterwards; the menu shows `OLD -> NEW` until you do. The default worker name uses the PC name, so restart the miner after the reboot. Not for domain-joined PCs. |
 | D | Put in Documents | Copies the script (and README) into `Documents\1_pearl_miner` and writes fresh `.cmd` launchers there. Works with a OneDrive-redirected Documents folder. |
 | 0 | Exit menu | Miner keeps running. |
@@ -36,7 +37,7 @@ Set your payout address in your Kryptex account; the script never handles wallet
 
 PPS (the pool's PPS+) logs in as `krxUSERNAME/worker`; SOLO as `solo:krxUSERNAME/worker`. Pool endpoint: `stratum+ssl://prl-eu.kryptex.network:8048`.
 
-The default worker is the mode plus your computer name with punctuation removed (for example `ppsDESKTOP1`, max 32 characters). Give each PC a unique computer name or an explicit worker, otherwise their stats merge in Kryptex.
+The default worker is the mode plus your computer name with punctuation removed (for example `ppsDESKTOP1`, max 32 characters). Option W appends an optional suffix (for example `ppsDESKTOP1b`). Give each PC a unique computer name or an explicit worker, otherwise their stats merge in Kryptex.
 
 Command-line options (all optional, usable from `Start-Pearl.cmd` or PowerShell):
 
