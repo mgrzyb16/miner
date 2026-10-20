@@ -36,9 +36,11 @@ $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Pearl Miner.l
 $scriptPath = $PSCommandPath
 $script:smi = $null
 $script:cfg = $null
+$script:menuPos = @{}
 
 function Get-Config {
-    $c = [ordered]@{ mining_username=''; mode='PPS'; startup=$false; autostart=$false; btc_per_th_day=0.0; api_port=12000; core_offset=0; mem_offset=0 }
+    $c = [ordered]@{ mining_username=''; mode='PPS'; startup=$false; autostart=$false; btc_per_th_day=0.0; api_port=12000; core_offset=0; mem_offset=0
+           core_min=-500; core_max=300; mem_min=-1000; mem_max=1500 }
     if (Test-Path $configFile) {
         $saved = Get-Content $configFile -Raw | ConvertFrom-Json
         foreach ($p in $saved.PSObject.Properties) { if ($c.Contains($p.Name)) { $c[$p.Name] = $p.Value } }
@@ -160,15 +162,30 @@ function Start-Miner {
     # Clock offsets are applied by KRig itself (nvidia-smi cannot set offsets); it resets them on exit.
     if ([int]$script:cfg.core_offset -ne 0) { $argsList += "--gpu-coffset=$([int]$script:cfg.core_offset)" }
     if ([int]$script:cfg.mem_offset -ne 0) { $argsList += "--gpu-moffset=$([int]$script:cfg.mem_offset)" }
-    $p = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -ArgumentList $argsList `
-        -WindowStyle Normal -PassThru
+    $sp = @{ FilePath=$exe; WorkingDirectory=(Split-Path $exe); ArgumentList=$argsList; WindowStyle='Normal'; PassThru=$true }
+    if ([int]$script:cfg.core_offset -ne 0 -or [int]$script:cfg.mem_offset -ne 0) {
+        # NVML refuses clock offsets without administrator rights ("Insufficient Permissions").
+        $sp.Verb = 'RunAs'
+        Write-Host 'Clock offsets need administrator rights: approve the Windows prompt to start the miner.' -ForegroundColor Yellow
+    }
+    $p = Start-Process @sp
     Write-Host "Miner started in its own window (PID $($p.Id)). Logs: $logDir" -ForegroundColor Green
 }
 
 function Stop-Miner {
     $running = @(Get-Process -Name krig-miner -ErrorAction SilentlyContinue)
     if ($running.Count -eq 0) { Write-Host 'No miner is running.' }
-    else { $running | Stop-Process -Force; Write-Host 'Miner stopped.' -ForegroundColor Green }
+    else {
+        try { $running | Stop-Process -Force }
+        catch {
+            # An elevated miner (started with clock offsets) can only be stopped with administrator rights.
+            Write-Host 'The miner runs with administrator rights: approve the Windows prompt to stop it.' -ForegroundColor Yellow
+            $k = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\taskkill.exe') -ArgumentList @('/F','/IM','krig-miner.exe') `
+                -Verb RunAs -Wait -PassThru -WindowStyle Hidden
+            if ($k.ExitCode -ne 0) { throw "taskkill exited with code $($k.ExitCode); the miner may still be running." }
+        }
+        Write-Host 'Miner stopped.' -ForegroundColor Green
+    }
 }
 
 function Show-Summary {
@@ -180,11 +197,15 @@ function Show-Summary {
         $proc = Get-Process -Name krig-miner -ErrorAction SilentlyContinue | Select-Object -First 1
         $api = $null; $apiErr = $null
         if ($proc) { try { $api = Invoke-RestMethod -Uri $uri -TimeoutSec 2 } catch { $apiErr = $_.Exception.Message } }
-        $watts = $null; $gpuText = 'GPU telemetry unavailable'
+        $watts = $null; $gpuText = 'GPU telemetry unavailable'; $gpuColor = 'Gray'
         if (Find-Smi) {
             try {
                 $g = Invoke-Smi 'power.draw,temperature.gpu,utilization.gpu,fan.speed' | ConvertFrom-Csv -Header watts,temp,util,fan
                 $gpuText = 'GPU: {0} W | {1} C | Load {2}% | Fan {3}%' -f $g.watts.Trim(),$g.temp.Trim(),$g.util.Trim(),$g.fan.Trim()
+                $tv = 0.0
+                if ([double]::TryParse($g.temp.Trim(),[Globalization.NumberStyles]::Float,[Globalization.CultureInfo]::InvariantCulture,[ref]$tv)) {
+                    if ($tv -ge 83) { $gpuColor = 'Red' } elseif ($tv -ge 75) { $gpuColor = 'Yellow' } else { $gpuColor = 'Green' }
+                }
                 $wv = 0.0
                 if ([double]::TryParse($g.watts.Trim(),[Globalization.NumberStyles]::Float,[Globalization.CultureInfo]::InvariantCulture,[ref]$wv)) {
                     $watts = $wv
@@ -196,7 +217,8 @@ function Show-Summary {
             } catch { $lastSample = $null }
         }
         Clear-Host
-        Write-Host "PEARL-POW (PRL) live summary | KRig $version" -ForegroundColor Cyan
+        Write-Banner 'Live summary'
+        Write-Host ''
         if (-not $proc) {
             Write-Host 'Miner is not running. (Start it from the menu; this view updates by itself.)' -ForegroundColor Yellow
         } else {
@@ -210,7 +232,11 @@ function Show-Summary {
                 } }
                 $th = $hr / 1e12
                 Write-Host ('Hashrate: {0:N2} TH/s' -f $th) -ForegroundColor Green
-                Write-Host "Shares: accepted $acc | stale $stale | rejected $rej"
+                Write-Host 'Shares: ' -NoNewline
+                Write-Host "accepted $acc" -NoNewline -ForegroundColor Green
+                Write-Host " | stale $stale | " -NoNewline
+                $rejColor = 'Gray'; if ($rej -gt 0) { $rejColor = 'Red' }
+                Write-Host "rejected $rej" -ForegroundColor $rejColor
                 if ($yield -gt 0) {
                     $btcDay = $th * $yield
                     Write-Host ('Estimated earnings: {0:N8} BTC/day | {1:N0} sat/day | {2:N0} sat/hour' -f $btcDay,($btcDay*1e8),($btcDay*1e8/24))
@@ -223,7 +249,7 @@ function Show-Summary {
                 Write-Host "Waiting for the miner API ($apiErr) - it may still be starting." -ForegroundColor Yellow
             }
         }
-        Write-Host $gpuText
+        Write-Host $gpuText -ForegroundColor $gpuColor
         if ($energyWh -gt 0) { Write-Host ('Sampled GPU energy this view: {0:N3} kWh' -f ($energyWh/1000)) }
         Write-Host 'Estimates use your manual yield; actual BTC balance is in the Kryptex dashboard.'
         Write-Host 'Q: back to menu (miner keeps running)' -ForegroundColor Yellow
@@ -278,22 +304,140 @@ function Read-Offset([string]$Label,[int]$Min,[int]$Max) {
     return $n
 }
 
+function Invoke-OffsetRestart {
+    if (-not (Get-Process -Name krig-miner -ErrorAction SilentlyContinue)) { Write-Host 'Saved. It applies the next time the miner starts.'; return }
+    if ((Read-Host 'Saved. The running miner still uses the old offsets. Restart it now to apply? (y/N)').Trim() -ne 'y') {
+        Write-Host 'Not restarted. The new offsets apply on the next miner start.'; return
+    }
+    Stop-Miner
+    Start-Sleep -Seconds 3
+    Start-Miner
+    Write-Host 'Check the miner log or window: the clock columns show the offset, for example "2505 (+200)".'
+}
+
+function Write-BoxLine([string]$Text,[string]$Color) {
+    Write-Host '  |' -ForegroundColor DarkCyan -NoNewline
+    Write-Host (' ' + $Text).PadRight(54).Substring(0,54) -ForegroundColor $Color -NoNewline
+    Write-Host '|' -ForegroundColor DarkCyan
+}
+
+function Write-Banner([string]$Subtitle) {
+    $rule = '  +' + ('-' * 54) + '+'
+    Write-Host ''
+    Write-Host $rule -ForegroundColor DarkCyan
+    Write-BoxLine ('PEARL-POW (PRL)  *  KRig {0}' -f $version) 'Cyan'
+    if ($Subtitle) { Write-BoxLine $Subtitle 'DarkGray' }
+    Write-Host $rule -ForegroundColor DarkCyan
+}
+
+function New-MenuItem([string]$Key,[string]$Label,[string]$Tag = '',[string]$TagColor = 'Gray') {
+    [pscustomobject]@{ Key=$Key; Label=$Label; Tag=$Tag; TagColor=$TagColor }
+}
+
+function Write-MenuItem($Item,[bool]$Selected) {
+    $mark = '   '
+    if ($Selected) { $mark = ' > ' }
+    $text = '{0}{1}  {2}' -f $mark,$Item.Key,$Item.Label
+    $tag = ''
+    if ($Item.Tag) { $tag = '[' + $Item.Tag + ']' }
+    $gap = [Math]::Max(1, 56 - $text.Length - $tag.Length)
+    Write-Host '  ' -NoNewline
+    if ($Selected) {
+        Write-Host (($text + (' ' * $gap) + $tag).PadRight(56)) -ForegroundColor White -BackgroundColor DarkCyan
+    } else {
+        Write-Host ($text + (' ' * $gap)) -NoNewline -ForegroundColor Gray
+        Write-Host $tag -ForegroundColor $Item.TagColor
+    }
+}
+
+function Wait-Key {
+    Write-Host '  Press any key to continue ...' -ForegroundColor DarkGray
+    if ([Console]::IsInputRedirected) { [void](Read-Host) } else { [void][Console]::ReadKey($true) }
+}
+
+# Arrow-key menu: Up/Down/Home/End + Enter, or press an item's key. Esc or Q returns '0'.
+function Select-Menu([string]$Name,[object[]]$Items) {
+    if ([Console]::IsInputRedirected) { return (Read-Host 'Select').Trim() }
+    $idx = 0
+    if ($script:menuPos.ContainsKey($Name)) { $idx = [Math]::Min([int]$script:menuPos[$Name], $Items.Count - 1) }
+    $top = -1
+    [Console]::CursorVisible = $false
+    try {
+        while ($true) {
+            if ($top -ge 0) { [Console]::SetCursorPosition(0,$top) }
+            for ($i = 0; $i -lt $Items.Count; $i++) { Write-MenuItem $Items[$i] ($i -eq $idx) }
+            Write-Host ''
+            Write-Host '  Up/Down + Enter, or press the number.  Esc = back' -ForegroundColor DarkGray
+            if ($top -lt 0) { $top = [Console]::CursorTop - $Items.Count - 2 }
+            $k = [Console]::ReadKey($true)
+            $key = $k.Key
+            if ($key -eq [ConsoleKey]::UpArrow) { $idx = ($idx + $Items.Count - 1) % $Items.Count }
+            elseif ($key -eq [ConsoleKey]::DownArrow) { $idx = ($idx + 1) % $Items.Count }
+            elseif ($key -eq [ConsoleKey]::Home) { $idx = 0 }
+            elseif ($key -eq [ConsoleKey]::End) { $idx = $Items.Count - 1 }
+            elseif ($key -eq [ConsoleKey]::Escape) { return '0' }
+            elseif ($key -eq [ConsoleKey]::Enter) { $script:menuPos[$Name] = $idx; return $Items[$idx].Key }
+            else {
+                $ch = [string]$k.KeyChar
+                if ($ch -eq 'q' -or $ch -eq 'Q') { return '0' }
+                for ($i = 0; $i -lt $Items.Count; $i++) {
+                    if ($Items[$i].Key -eq $ch) { $script:menuPos[$Name] = $i; return $ch }
+                }
+            }
+        }
+    } finally { [Console]::CursorVisible = $true }
+}
+
+function Read-Limit([string]$Label,[int]$Current,[int]$Min,[int]$Max) {
+    $v = (Read-Host "$Label (now $Current, allowed $Min..$Max, Enter = keep)").Trim()
+    if (-not $v) { return $Current }
+    $n = 0
+    if (-not [int]::TryParse($v,[ref]$n) -or $n -lt $Min -or $n -gt $Max) { throw "Invalid value for $Label. Nothing changed." }
+    return $n
+}
+
+function Set-OffsetLimits {
+    $c = $script:cfg
+    $cmin = Read-Limit 'Core minimum offset (MHz)' ([int]$c.core_min) -2000 0
+    $cmax = Read-Limit 'Core maximum offset (MHz)' ([int]$c.core_max) 0 2000
+    $mmin = Read-Limit 'Memory minimum offset (MHz)' ([int]$c.mem_min) -5000 0
+    $mmax = Read-Limit 'Memory maximum offset (MHz)' ([int]$c.mem_max) 0 5000
+    $c.core_min = $cmin; $c.core_max = $cmax; $c.mem_min = $mmin; $c.mem_max = $mmax
+    # Keep saved offsets inside the new limits.
+    $c.core_offset = [Math]::Min([Math]::Max([int]$c.core_offset,$cmin),$cmax)
+    $c.mem_offset = [Math]::Min([Math]::Max([int]$c.mem_offset,$mmin),$mmax)
+    Save-Config
+    Write-Host ('Limits saved: core {0}..{1} MHz, memory {2}..{3} MHz.' -f $cmin,$cmax,$mmin,$mmax) -ForegroundColor Green
+}
+
 function Show-GpuSettings {
     while ($true) {
         $pi = Get-PowerInfo
+        $co = [int]$script:cfg.core_offset; $mo = [int]$script:cfg.mem_offset
         Clear-Host
-        Write-Host "GPU settings | $($pi.Name)" -ForegroundColor Cyan
-        Write-Host ('Power now: {0:N1} W | Limit: {1:N0} W (default {2:N0}, allowed {3:N0}-{4:N0})' -f $pi.Draw,$pi.Limit,$pi.Default,$pi.Min,$pi.Max)
-        Write-Host ('Miner clock offsets (applied when the miner starts): core {0:+#;-#;0} MHz | memory {1:+#;-#;0} MHz' -f [int]$script:cfg.core_offset,[int]$script:cfg.mem_offset)
+        Write-Banner "GPU settings - $($pi.Name)"
         Write-Host ''
-        Write-Host '  1) Set power limit (asks for administrator approval)'
-        Write-Host '  2) Reset power limit to default'
-        Write-Host '  3) Set core clock offset'
-        Write-Host '  4) Set memory clock offset'
-        Write-Host '  5) Clear both offsets'
-        Write-Host '  0) Back'
-        Write-Host 'nvidia-smi cannot set clock offsets; they are passed to KRig (--gpu-coffset / --gpu-moffset) and take effect on the next miner start. Unstable values crash the miner.' -ForegroundColor Yellow
-        $c = (Read-Host 'Select').Trim()
+        Write-Host '  Power draw   ' -NoNewline -ForegroundColor DarkGray
+        Write-Host ('{0:N0} W' -f $pi.Draw) -ForegroundColor White
+        Write-Host '  Power limit  ' -NoNewline -ForegroundColor DarkGray
+        Write-Host ('{0:N0} W' -f $pi.Limit) -NoNewline -ForegroundColor Yellow
+        Write-Host ('   (default {0:N0}, allowed {1:N0}-{2:N0})' -f $pi.Default,$pi.Min,$pi.Max) -ForegroundColor DarkGray
+        Write-Host '  Offsets      ' -NoNewline -ForegroundColor DarkGray
+        Write-Host ('core {0:+#;-#;0} MHz | memory {1:+#;-#;0} MHz' -f $co,$mo) -NoNewline -ForegroundColor Yellow
+        Write-Host '   (applied at miner start)' -ForegroundColor DarkGray
+        Write-Host ''
+        $items = @(
+            New-MenuItem '1' 'Set power limit' ('{0:N0} W' -f $pi.Limit) 'Yellow'
+            New-MenuItem '2' 'Reset power limit to default' ('{0:N0} W' -f $pi.Default) 'DarkGray'
+            New-MenuItem '3' 'Core clock offset' ('{0:+#;-#;0} MHz' -f $co) 'Yellow'
+            New-MenuItem '4' 'Memory clock offset' ('{0:+#;-#;0} MHz' -f $mo) 'Yellow'
+            New-MenuItem '5' 'Clear both offsets'
+            New-MenuItem '6' 'Offset limits' ('core {0}..{1}  mem {2}..{3}' -f [int]$script:cfg.core_min,[int]$script:cfg.core_max,[int]$script:cfg.mem_min,[int]$script:cfg.mem_max) 'DarkGray'
+            New-MenuItem '0' 'Back'
+        )
+        $c = Select-Menu 'gpu' $items
+        Write-Host ''
+        if ($c -ne '0') { Write-Host '  Power limit and offsets need administrator approval (Windows prompt).' -ForegroundColor DarkYellow }
         try {
             switch ($c) {
                 '1' {
@@ -302,14 +446,15 @@ function Show-GpuSettings {
                     Set-PowerLimit $w
                 }
                 '2' { Set-PowerLimit $pi.Default }
-                '3' { $script:cfg.core_offset = Read-Offset 'Core' -500 300; Save-Config; Write-Host 'Saved. Restart the miner to apply.' }
-                '4' { $script:cfg.mem_offset = Read-Offset 'Memory' -1000 1500; Save-Config; Write-Host 'Saved. Restart the miner to apply.' }
-                '5' { $script:cfg.core_offset = 0; $script:cfg.mem_offset = 0; Save-Config; Write-Host 'Offsets cleared.' }
+                '3' { $script:cfg.core_offset = Read-Offset 'Core' ([int]$script:cfg.core_min) ([int]$script:cfg.core_max); Save-Config; Invoke-OffsetRestart }
+                '4' { $script:cfg.mem_offset = Read-Offset 'Memory' ([int]$script:cfg.mem_min) ([int]$script:cfg.mem_max); Save-Config; Invoke-OffsetRestart }
+                '5' { $script:cfg.core_offset = 0; $script:cfg.mem_offset = 0; Save-Config; Invoke-OffsetRestart }
+                '6' { Set-OffsetLimits }
                 '0' { return }
                 default { Write-Host 'Invalid choice.' -ForegroundColor Red }
             }
         } catch { Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red }
-        if ($c -ne '0') { Read-Host 'Press Enter to continue' | Out-Null }
+        Wait-Key
     }
 }
 
@@ -386,24 +531,40 @@ function Show-Menu {
         $running = Get-Process -Name krig-miner -ErrorAction SilentlyContinue | Select-Object -First 1
         $script:cfg.startup = [bool](Test-Path $startupLnk)
         if (-not $script:cfg.startup) { $script:cfg.autostart = $false }
-        $onoff = @{ $true='ON'; $false='OFF' }
+        $hrText = ''
+        if ($running) {
+            try {
+                $a = Invoke-RestMethod -Uri "http://127.0.0.1:$([int]$script:cfg.api_port)/" -TimeoutSec 1
+                $hr = 0.0
+                foreach ($d in @($a.devices)) { foreach ($al in @($d.algorithms)) { $hr += [double]$al.hashrate } }
+                $hrText = ' | {0:N1} TH/s' -f ($hr / 1e12)
+            } catch { }
+        }
+        $acct = [string]$script:cfg.mining_username
+        if (-not $acct) { $acct = 'not set yet' }
         Clear-Host
-        Write-Host "PEARL-POW (PRL) | KRig $version" -ForegroundColor Cyan
-        if ($running) { Write-Host "Miner: RUNNING (PID $($running.Id))" -ForegroundColor Green }
-        else { Write-Host 'Miner: stopped' -ForegroundColor Yellow }
+        Write-Banner ('Account: {0} | Mode: {1}' -f $acct,$script:cfg.mode)
         Write-Host ''
-        Write-Host '  1) Start miner'
-        Write-Host '  2) Stop miner'
-        Write-Host '  3) Live TH/s and earnings summary'
-        Write-Host ('  4) Start this menu with Windows: {0}' -f $onoff[[bool]$script:cfg.startup])
-        Write-Host ('  5) Auto-start mining after restart: {0}' -f $onoff[[bool]$script:cfg.autostart])
-        Write-Host ('  6) Earnings yield (BTC per TH/s per day): {0}' -f $script:cfg.btc_per_th_day)
-        Write-Host '  7) Put in Documents (copy to Documents\1_pearl_miner)'
-        Write-Host '  8) GPU settings (power limit, clock offsets)'
-        Write-Host '  9) Update script from GitHub (opens a new window and restarts)'
-        Write-Host '  0) Exit menu (miner keeps running)'
+        Write-Host '  Miner  ' -NoNewline -ForegroundColor DarkGray
+        if ($running) { Write-Host ("RUNNING (PID $($running.Id))$hrText") -ForegroundColor Green }
+        else { Write-Host 'stopped' -ForegroundColor Yellow }
         Write-Host ''
-        $c = (Read-Host 'Select').Trim()
+        $su = 'OFF'; $suColor = 'DarkGray'; if ($script:cfg.startup) { $su = 'ON'; $suColor = 'Green' }
+        $as = 'OFF'; $asColor = 'DarkGray'; if ($script:cfg.autostart) { $as = 'ON'; $asColor = 'Green' }
+        $items = @(
+            New-MenuItem '1' 'Start miner'
+            New-MenuItem '2' 'Stop miner'
+            New-MenuItem '3' 'Live TH/s and earnings summary'
+            New-MenuItem '4' 'Start this menu with Windows' $su $suColor
+            New-MenuItem '5' 'Auto-start mining after restart' $as $asColor
+            New-MenuItem '6' 'Earnings yield (BTC per TH/s/day)' ([string]$script:cfg.btc_per_th_day) 'Yellow'
+            New-MenuItem '7' 'Put in Documents (1_pearl_miner)'
+            New-MenuItem '8' 'GPU settings (power, clock offsets)'
+            New-MenuItem '9' 'Update script from GitHub'
+            New-MenuItem '0' 'Exit menu (miner keeps running)'
+        )
+        $c = Select-Menu 'main' $items
+        Write-Host ''
         $pause = $true
         try {
             switch ($c) {
@@ -416,7 +577,7 @@ function Show-Menu {
                     $script:cfg.startup = $new
                     if (-not $new) { $script:cfg.autostart = $false }
                     Save-Config
-                    Write-Host ('Windows startup: {0}' -f $onoff[$new])
+                    Write-Host ('Windows startup: {0}' -f $(if ($new) { 'ON' } else { 'OFF' }))
                     if (-not $new) { Write-Host 'Auto-start mining was also turned OFF.' }
                 }
                 '5' {
@@ -428,7 +589,7 @@ function Show-Menu {
                     }
                     $script:cfg.autostart = $new
                     Save-Config
-                    Write-Host ('Auto-start mining after restart: {0}' -f $onoff[$new])
+                    Write-Host ('Auto-start mining after restart: {0}' -f $(if ($new) { 'ON' } else { 'OFF' }))
                 }
                 '6' {
                     $v = (Read-Host 'BTC per TH/s per day (e.g. 0.0000001, 0 to clear)').Trim().Replace(',','.')
@@ -441,11 +602,10 @@ function Show-Menu {
                 '8' { Show-GpuSettings; $pause = $false }
                 '9' { Start-SelfUpdate; Start-Sleep -Seconds 1; return }
                 '0' { return }
-                'q' { return }
                 default { Write-Host 'Invalid choice.' -ForegroundColor Red }
             }
         } catch { Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red }
-        if ($pause) { Read-Host 'Press Enter to continue' | Out-Null }
+        if ($pause) { Wait-Key }
     }
 }
 
