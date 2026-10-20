@@ -16,7 +16,7 @@ param(
     [ValidateRange(0,1000)][double]$BtcPerTHDay = 0,
     [ValidateSet('info','debug')][string]$LogLevel = 'info',
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'PearlMining'),
-    [ValidateSet('Menu','Start','Stop','Summary')][string]$Action = 'Menu',
+    [ValidateSet('Menu','Start','Stop','Summary','Install')][string]$Action = 'Menu',
     [switch]$Stop,
     [switch]$Boot,
     [switch]$SetupOnly,
@@ -243,6 +243,22 @@ function Set-StartupHook([bool]$On) {
     } elseif (Test-Path $startupLnk) { Remove-Item $startupLnk -Force }
 }
 
+function Install-ToDocuments {
+    if (-not $scriptPath) { throw 'Cannot copy: save this script to a .ps1 file and run it from there.' }
+    $dest = Join-Path ([Environment]::GetFolderPath('MyDocuments')) '1_pearl_miner'
+    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+    $target = Join-Path $dest 'Start-Pearl.ps1'
+    if ((Resolve-Path $scriptPath).Path -ne $target) { Copy-Item -LiteralPath $scriptPath -Destination $target -Force }
+    $readme = Join-Path (Split-Path $scriptPath) 'README-Pearl.md'
+    if (Test-Path $readme) { Copy-Item -LiteralPath $readme -Destination (Join-Path $dest 'README-Pearl.md') -Force }
+    $ps = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Start-Pearl.ps1"'
+    Set-Content (Join-Path $dest 'Start-Pearl.cmd') -Encoding ASCII -Value "@echo off`r`n$ps %*`r`npause`r`n"
+    Set-Content (Join-Path $dest 'Stop-Pearl.cmd') -Encoding ASCII -Value "@echo off`r`n$ps -Stop %*`r`npause`r`n"
+    Write-Host "Copied to: $dest" -ForegroundColor Green
+    Write-Host 'Run Start-Pearl.cmd from there. If Windows startup (option 4) was enabled from another folder,'
+    Write-Host 'turn it off and on again from the new copy so the shortcut points at it.'
+}
+
 function Show-Menu {
     while ($true) {
         $running = Get-Process -Name krig-miner -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -260,6 +276,7 @@ function Show-Menu {
         Write-Host ('  4) Start this menu with Windows: {0}' -f $onoff[[bool]$script:cfg.startup])
         Write-Host ('  5) Auto-start mining after restart: {0}' -f $onoff[[bool]$script:cfg.autostart])
         Write-Host ('  6) Earnings yield (BTC per TH/s per day): {0}' -f $script:cfg.btc_per_th_day)
+        Write-Host '  7) Put in Documents (copy to Documents\1_pearl_miner)'
         Write-Host '  0) Exit menu (miner keeps running)'
         Write-Host ''
         $c = (Read-Host 'Select').Trim()
@@ -296,6 +313,7 @@ function Show-Menu {
                         $script:cfg.btc_per_th_day = $d; Save-Config; Write-Host 'Saved.'
                     } else { Write-Host 'Invalid number.' -ForegroundColor Red }
                 }
+                '7' { Install-ToDocuments }
                 '0' { return }
                 'q' { return }
                 default { Write-Host 'Invalid choice.' -ForegroundColor Red }
@@ -316,6 +334,7 @@ switch ($Action) {
     'Start'   { Start-Miner }
     'Stop'    { Stop-Miner }
     'Summary' { Show-Summary }
+    'Install' { Install-ToDocuments }
     default {
         if ($Boot -and $script:cfg.autostart) {
             # Give the NVIDIA driver and network a moment after logon.
