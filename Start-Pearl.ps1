@@ -16,7 +16,10 @@ param(
     [ValidateRange(0,1000)][double]$BtcPerTHDay = 0,
     [ValidateSet('info','debug')][string]$LogLevel = 'info',
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'PearlMining'),
-    [ValidateSet('Menu','Start','Stop','Summary','Install')][string]$Action = 'Menu',
+    [ValidateSet('Menu','Start','Stop','Summary','Install','Update')][string]$Action = 'Menu',
+    [string]$UpdateUrl = 'https://raw.githubusercontent.com/mgrzyb16/miner/main/Start-Pearl.ps1',
+    [int]$ParentPid = 0,
+    [string]$UpdateTarget,
     [switch]$Stop,
     [switch]$Boot,
     [switch]$SetupOnly,
@@ -35,7 +38,7 @@ $script:smi = $null
 $script:cfg = $null
 
 function Get-Config {
-    $c = [ordered]@{ mining_username=''; mode='PPS'; startup=$false; autostart=$false; btc_per_th_day=0.0; api_port=12000 }
+    $c = [ordered]@{ mining_username=''; mode='PPS'; startup=$false; autostart=$false; btc_per_th_day=0.0; api_port=12000; core_offset=0; mem_offset=0 }
     if (Test-Path $configFile) {
         $saved = Get-Content $configFile -Raw | ConvertFrom-Json
         foreach ($p in $saved.PSObject.Properties) { if ($c.Contains($p.Name)) { $c[$p.Name] = $p.Value } }
@@ -154,6 +157,9 @@ function Start-Miner {
     $argsList = @('--coin','pearl','--url',$pool,'--user',$login,'--no-rocm','--no-tui',
                   '--log-level',$LogLevel,'--log-file',('"' + $nativeLog + '"'),
                   '--api-port',[string]$script:cfg.api_port,'--api-host','127.0.0.1')
+    # Clock offsets are applied by KRig itself (nvidia-smi cannot set offsets); it resets them on exit.
+    if ([int]$script:cfg.core_offset -ne 0) { $argsList += "--gpu-coffset=$([int]$script:cfg.core_offset)" }
+    if ([int]$script:cfg.mem_offset -ne 0) { $argsList += "--gpu-moffset=$([int]$script:cfg.mem_offset)" }
     $p = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -ArgumentList $argsList `
         -WindowStyle Normal -PassThru
     Write-Host "Miner started in its own window (PID $($p.Id)). Logs: $logDir" -ForegroundColor Green
@@ -243,6 +249,70 @@ function Set-StartupHook([bool]$On) {
     } elseif (Test-Path $startupLnk) { Remove-Item $startupLnk -Force }
 }
 
+function ConvertTo-InvariantDouble([string]$s) {
+    $d = 0.0
+    if ([double]::TryParse($s.Trim(),[Globalization.NumberStyles]::Float,[Globalization.CultureInfo]::InvariantCulture,[ref]$d)) { return $d }
+    return $null
+}
+
+function Get-PowerInfo {
+    if (-not (Find-Smi)) { throw 'nvidia-smi not found. Install the NVIDIA driver first.' }
+    $g = Invoke-Smi 'name,power.draw,power.limit,power.default_limit,power.min_limit,power.max_limit' |
+        ConvertFrom-Csv -Header name,draw,limit,default,min,max
+    return [pscustomobject]@{ Name=$g.name.Trim(); Draw=(ConvertTo-InvariantDouble $g.draw); Limit=(ConvertTo-InvariantDouble $g.limit);
+        Default=(ConvertTo-InvariantDouble $g.default); Min=(ConvertTo-InvariantDouble $g.min); Max=(ConvertTo-InvariantDouble $g.max) }
+}
+
+function Set-PowerLimit([double]$Watts) {
+    # Changing the limit needs administrator rights: only this one nvidia-smi call is elevated (UAC prompt).
+    $p = Start-Process -FilePath (Find-Smi) -ArgumentList @('-i','0','-pl',[string][int]$Watts) -Verb RunAs -Wait -PassThru -WindowStyle Hidden
+    if ($p.ExitCode -ne 0) { throw "nvidia-smi exited with code $($p.ExitCode); the power limit was not changed." }
+    $now = (Get-PowerInfo).Limit
+    Write-Host ('Power limit is now {0:N0} W (resets to default after a reboot or driver reload).' -f $now) -ForegroundColor Green
+}
+
+function Read-Offset([string]$Label,[int]$Min,[int]$Max) {
+    $v = (Read-Host "$Label offset in MHz ($Min..$Max, 0 = off)").Trim()
+    $n = 0
+    if (-not [int]::TryParse($v,[ref]$n) -or $n -lt $Min -or $n -gt $Max) { throw 'Invalid value. Nothing changed.' }
+    return $n
+}
+
+function Show-GpuSettings {
+    while ($true) {
+        $pi = Get-PowerInfo
+        Clear-Host
+        Write-Host "GPU settings | $($pi.Name)" -ForegroundColor Cyan
+        Write-Host ('Power now: {0:N1} W | Limit: {1:N0} W (default {2:N0}, allowed {3:N0}-{4:N0})' -f $pi.Draw,$pi.Limit,$pi.Default,$pi.Min,$pi.Max)
+        Write-Host ('Miner clock offsets (applied when the miner starts): core {0:+#;-#;0} MHz | memory {1:+#;-#;0} MHz' -f [int]$script:cfg.core_offset,[int]$script:cfg.mem_offset)
+        Write-Host ''
+        Write-Host '  1) Set power limit (asks for administrator approval)'
+        Write-Host '  2) Reset power limit to default'
+        Write-Host '  3) Set core clock offset'
+        Write-Host '  4) Set memory clock offset'
+        Write-Host '  5) Clear both offsets'
+        Write-Host '  0) Back'
+        Write-Host 'nvidia-smi cannot set clock offsets; they are passed to KRig (--gpu-coffset / --gpu-moffset) and take effect on the next miner start. Unstable values crash the miner.' -ForegroundColor Yellow
+        $c = (Read-Host 'Select').Trim()
+        try {
+            switch ($c) {
+                '1' {
+                    $w = ConvertTo-InvariantDouble (Read-Host ('Power limit in watts ({0:N0}-{1:N0})' -f $pi.Min,$pi.Max))
+                    if ($null -eq $w -or $w -lt $pi.Min -or $w -gt $pi.Max) { throw 'Value outside the allowed range. Nothing changed.' }
+                    Set-PowerLimit $w
+                }
+                '2' { Set-PowerLimit $pi.Default }
+                '3' { $script:cfg.core_offset = Read-Offset 'Core' -500 300; Save-Config; Write-Host 'Saved. Restart the miner to apply.' }
+                '4' { $script:cfg.mem_offset = Read-Offset 'Memory' -1000 1500; Save-Config; Write-Host 'Saved. Restart the miner to apply.' }
+                '5' { $script:cfg.core_offset = 0; $script:cfg.mem_offset = 0; Save-Config; Write-Host 'Offsets cleared.' }
+                '0' { return }
+                default { Write-Host 'Invalid choice.' -ForegroundColor Red }
+            }
+        } catch { Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red }
+        if ($c -ne '0') { Read-Host 'Press Enter to continue' | Out-Null }
+    }
+}
+
 function Install-ToDocuments {
     if (-not $scriptPath) { throw 'Cannot copy: save this script to a .ps1 file and run it from there.' }
     $dest = Join-Path ([Environment]::GetFolderPath('MyDocuments')) '1_pearl_miner'
@@ -257,6 +327,58 @@ function Install-ToDocuments {
     Write-Host "Copied to: $dest" -ForegroundColor Green
     Write-Host 'Run Start-Pearl.cmd from there. If Windows startup (option 4) was enabled from another folder,'
     Write-Host 'turn it off and on again from the new copy so the shortcut points at it.'
+}
+
+function Start-SelfUpdate {
+    if (-not $scriptPath) { throw 'Cannot update: run this from a saved .ps1 file.' }
+    # The updater runs from a temp copy so it can safely replace the real script.
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('pearl-updater-' + [guid]::NewGuid().ToString('N') + '.ps1')
+    Copy-Item -LiteralPath $scriptPath -Destination $tmp
+    Start-Process -FilePath powershell.exe -WindowStyle Normal -ArgumentList @(
+        '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $tmp + '"'),'-Action','Update',
+        '-ParentPid',[string]$PID,'-UpdateTarget',('"' + $scriptPath + '"'),'-InstallDir',('"' + $InstallDir + '"'))
+    Write-Host 'Updater opened in a new window. This menu will close; the miner (if running) is not affected.' -ForegroundColor Green
+}
+
+function Invoke-SelfUpdate {
+    $relaunch = $true
+    try {
+        if (-not $UpdateTarget -or -not (Test-Path -LiteralPath $UpdateTarget)) { throw 'Update target script not found.' }
+        if ($UpdateUrl -notmatch '^(https|file)://') { throw 'Update URL must be https:// (or file:// for testing).' }
+        Write-Host 'Waiting for the menu window to close ...'
+        if ($ParentPid -gt 0) { Wait-Process -Id $ParentPid -Timeout 15 -ErrorAction SilentlyContinue }
+        $new = Join-Path ([IO.Path]::GetTempPath()) ('pearl-update-' + [guid]::NewGuid().ToString('N') + '.ps1')
+        $fetch = $UpdateUrl
+        if ($fetch -like 'https://*') { $fetch += '?t=' + [DateTime]::UtcNow.Ticks }   # bypass the raw-file CDN cache
+        Write-Host "Downloading $UpdateUrl ..."
+        try { Invoke-WebRequest -Uri $fetch -OutFile $new -UseBasicParsing -TimeoutSec 60 }
+        catch { throw "Download failed: $($_.Exception.Message) (a private repository returns 404)" }
+        $len = (Get-Item $new).Length
+        if ($len -lt 5000 -or $len -gt 1MB) { throw "Downloaded file has an unexpected size ($len bytes)." }
+        $errs = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($new,[ref]$null,[ref]$errs)
+        if ($errs) { throw "Downloaded script does not parse: $($errs[0].Message)" }
+        if (-not (Select-String -LiteralPath $new -Pattern 'PEARL-POW' -Quiet)) { throw 'Downloaded file does not look like this miner script.' }
+        $oldHash = (Get-FileHash $UpdateTarget -Algorithm SHA256).Hash
+        $newHash = (Get-FileHash $new -Algorithm SHA256).Hash
+        if ($oldHash -eq $newHash) { Write-Host 'Already up to date.' -ForegroundColor Green }
+        else {
+            Copy-Item -LiteralPath $UpdateTarget -Destination "$UpdateTarget.bak" -Force
+            Copy-Item -LiteralPath $new -Destination $UpdateTarget -Force
+            Write-Host ('Updated: {0} -> {1} (previous version saved as .bak)' -f $oldHash.Substring(0,8),$newHash.Substring(0,8)) -ForegroundColor Green
+        }
+        Remove-Item $new -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Host "Update failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host 'The current script was left unchanged.' -ForegroundColor Yellow
+    }
+    if ($relaunch -and $UpdateTarget -and (Test-Path -LiteralPath $UpdateTarget)) {
+        Write-Host 'Restarting the menu ...'
+        Start-Sleep -Seconds 3
+        Start-Process -FilePath powershell.exe -WindowStyle Normal -ArgumentList @(
+            '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $UpdateTarget + '"'),'-InstallDir',('"' + $InstallDir + '"'))
+    }
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue   # temp updater copy
 }
 
 function Show-Menu {
@@ -277,6 +399,8 @@ function Show-Menu {
         Write-Host ('  5) Auto-start mining after restart: {0}' -f $onoff[[bool]$script:cfg.autostart])
         Write-Host ('  6) Earnings yield (BTC per TH/s per day): {0}' -f $script:cfg.btc_per_th_day)
         Write-Host '  7) Put in Documents (copy to Documents\1_pearl_miner)'
+        Write-Host '  8) GPU settings (power limit, clock offsets)'
+        Write-Host '  9) Update script from GitHub (opens a new window and restarts)'
         Write-Host '  0) Exit menu (miner keeps running)'
         Write-Host ''
         $c = (Read-Host 'Select').Trim()
@@ -314,6 +438,8 @@ function Show-Menu {
                     } else { Write-Host 'Invalid number.' -ForegroundColor Red }
                 }
                 '7' { Install-ToDocuments }
+                '8' { Show-GpuSettings; $pause = $false }
+                '9' { Start-SelfUpdate; Start-Sleep -Seconds 1; return }
                 '0' { return }
                 'q' { return }
                 default { Write-Host 'Invalid choice.' -ForegroundColor Red }
@@ -323,6 +449,7 @@ function Show-Menu {
     }
 }
 
+if ($Action -eq 'Update') { Invoke-SelfUpdate; return }
 if (-not [Environment]::Is64BitOperatingSystem) { throw 'Windows x64 is required.' }
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 $script:cfg = Get-Config
