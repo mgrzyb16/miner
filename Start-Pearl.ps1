@@ -107,6 +107,14 @@ function Install-Miner {
 }
 
 # Default worker = mode + PC name + saved suffix. Kryptex allows 32 Latin letters/numbers; the suffix is kept, the PC name is trimmed.
+function Get-WorkerStatus {
+    $sfx = [string]$script:cfg.worker_suffix
+    if (-not $sfx) { $sfx = 'none' }
+    $mode = [string]$script:cfg.mode
+    if (-not $mode) { $mode = 'PPS' }
+    return 'Worker {0} | Suffix: {1}' -f (Get-DefaultWorker $mode),$sfx
+}
+
 function Get-DefaultWorker([string]$m) {
     $sfx = [string]$script:cfg.worker_suffix
     $base = $m.ToLowerInvariant() + ($env:COMPUTERNAME -replace '[^A-Za-z0-9]','')
@@ -258,6 +266,7 @@ function Show-Summary {
         } else {
             try { $up = $now - $proc.StartTime; $upText = '{0}h {1:00}m {2:00}s' -f [int][math]::Floor($up.TotalHours),$up.Minutes,$up.Seconds } catch { $upText = 'n/a' }
             Write-Host "Miner: running (PID $($proc.Id)) | Uptime $upText"
+            Write-Host (Get-WorkerStatus)
             if ($api) {
                 $hr = 0.0; $acc = 0; $stale = 0; $rej = 0
                 foreach ($d in @($api.devices)) { foreach ($a in @($d.algorithms)) {
@@ -874,6 +883,8 @@ function Show-Menu {
         Write-Host '  Miner  ' -NoNewline -ForegroundColor DarkGray
         if ($running) { Write-Host ("RUNNING (PID $($running.Id))$hrText") -ForegroundColor Green }
         else { Write-Host 'stopped' -ForegroundColor Yellow }
+        Write-Host '  ' -NoNewline
+        Write-Host (Get-WorkerStatus) -ForegroundColor DarkGray
         Write-Host ''
         $su = 'OFF'; $suColor = 'DarkGray'; if ($script:cfg.startup) { $su = 'ON'; $suColor = 'Green' }
         $as = 'OFF'; $asColor = 'DarkGray'; if ($script:cfg.autostart) { $as = 'ON'; $asColor = 'Green' }
