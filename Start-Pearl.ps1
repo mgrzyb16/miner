@@ -16,7 +16,7 @@ param(
     [ValidateRange(0,1000)][double]$BtcPerTHDay = 0,
     [ValidateSet('info','debug')][string]$LogLevel = 'info',
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'PearlMining'),
-    [ValidateSet('Menu','Start','Stop','Summary','Install','Update')][string]$Action = 'Menu',
+    [ValidateSet('Menu','Start','Stop','Summary','Install','Update','FanControl')][string]$Action = 'Menu',
     [string]$UpdateUrl = 'https://raw.githubusercontent.com/mgrzyb16/miner/main/Start-Pearl.ps1',
     [int]$ParentPid = 0,
     [string]$UpdateTarget,
@@ -37,10 +37,12 @@ $scriptPath = $PSCommandPath
 $script:smi = $null
 $script:cfg = $null
 $script:menuPos = @{}
+$script:isAdmin = $false
 
 function Get-Config {
     $c = [ordered]@{ mining_username=''; mode='PPS'; startup=$false; autostart=$false; btc_per_th_day=0.0; api_port=12000; core_offset=0; mem_offset=0
-           core_min=-500; core_max=300; mem_min=-1000; mem_max=1500 }
+           core_min=-500; core_max=300; mem_min=-1000; mem_max=1500
+           fan_mode='auto'; fan_percent=60; fan_curve='50:35,60:50,70:65,75:75,80:90,85:100' }
     if (Test-Path $configFile) {
         $saved = Get-Content $configFile -Raw | ConvertFrom-Json
         foreach ($p in $saved.PSObject.Properties) { if ($c.Contains($p.Name)) { $c[$p.Name] = $p.Value } }
@@ -163,13 +165,22 @@ function Start-Miner {
     if ([int]$script:cfg.core_offset -ne 0) { $argsList += "--gpu-coffset=$([int]$script:cfg.core_offset)" }
     if ([int]$script:cfg.mem_offset -ne 0) { $argsList += "--gpu-moffset=$([int]$script:cfg.mem_offset)" }
     $sp = @{ FilePath=$exe; WorkingDirectory=(Split-Path $exe); ArgumentList=$argsList; WindowStyle='Normal'; PassThru=$true }
-    if ([int]$script:cfg.core_offset -ne 0 -or [int]$script:cfg.mem_offset -ne 0) {
+    if (-not $script:isAdmin -and ([int]$script:cfg.core_offset -ne 0 -or [int]$script:cfg.mem_offset -ne 0)) {
         # NVML refuses clock offsets without administrator rights ("Insufficient Permissions").
         $sp.Verb = 'RunAs'
         Write-Host 'Clock offsets need administrator rights: approve the Windows prompt to start the miner.' -ForegroundColor Yellow
     }
     $p = Start-Process @sp
     Write-Host "Miner started in its own window (PID $($p.Id)). Logs: $logDir" -ForegroundColor Green
+    if ($script:cfg.fan_mode -eq 'manual') {
+        # Manual fan speed does not survive a reboot, so reapply it whenever we can.
+        if ($script:isAdmin) {
+            try { Set-Fan 'manual' ([int]$script:cfg.fan_percent); Write-Host "Fans set to $([int]$script:cfg.fan_percent)% (manual)." -ForegroundColor Green }
+            catch { Write-Host "Could not set fan speed: $($_.Exception.Message)" -ForegroundColor Red }
+        } else { Write-Host 'Manual fan speed is saved but only applies from an elevated menu (press E).' -ForegroundColor Yellow }
+    } elseif ($script:cfg.fan_mode -eq 'curve') {
+        Start-FanController
+    }
 }
 
 function Stop-Miner {
@@ -283,15 +294,179 @@ function ConvertTo-InvariantDouble([string]$s) {
 
 function Get-PowerInfo {
     if (-not (Find-Smi)) { throw 'nvidia-smi not found. Install the NVIDIA driver first.' }
-    $g = Invoke-Smi 'name,power.draw,power.limit,power.default_limit,power.min_limit,power.max_limit' |
-        ConvertFrom-Csv -Header name,draw,limit,default,min,max
+    $g = Invoke-Smi 'name,power.draw,power.limit,power.default_limit,power.min_limit,power.max_limit,fan.speed,temperature.gpu' |
+        ConvertFrom-Csv -Header name,draw,limit,default,min,max,fan,temp
     return [pscustomobject]@{ Name=$g.name.Trim(); Draw=(ConvertTo-InvariantDouble $g.draw); Limit=(ConvertTo-InvariantDouble $g.limit);
-        Default=(ConvertTo-InvariantDouble $g.default); Min=(ConvertTo-InvariantDouble $g.min); Max=(ConvertTo-InvariantDouble $g.max) }
+        Default=(ConvertTo-InvariantDouble $g.default); Min=(ConvertTo-InvariantDouble $g.min); Max=(ConvertTo-InvariantDouble $g.max);
+        Fan=(ConvertTo-InvariantDouble $g.fan); Temp=(ConvertTo-InvariantDouble $g.temp) }
+}
+
+function Initialize-Nvml {
+    if ('PearlNvml' -as [type]) { return }
+    # nvidia-smi cannot control fans on Windows; NVML (installed with the driver) can.
+    Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class PearlNvml {
+  const string D = "nvml.dll";
+  [DllImport(D)] static extern int nvmlInit_v2();
+  [DllImport(D)] static extern int nvmlShutdown();
+  [DllImport(D)] static extern int nvmlDeviceGetHandleByIndex_v2(uint i, out IntPtr dev);
+  [DllImport(D)] static extern int nvmlDeviceGetNumFans(IntPtr dev, out uint n);
+  [DllImport(D)] static extern int nvmlDeviceSetFanSpeed_v2(IntPtr dev, uint fan, uint speed);
+  [DllImport(D)] static extern int nvmlDeviceSetDefaultFanSpeed_v2(IntPtr dev, uint fan);
+  static IntPtr Open(out uint fans) {
+    int r = nvmlInit_v2(); if (r != 0) throw new Exception("nvmlInit failed: " + r);
+    IntPtr dev; r = nvmlDeviceGetHandleByIndex_v2(0, out dev); if (r != 0) throw new Exception("GetHandle failed: " + r);
+    r = nvmlDeviceGetNumFans(dev, out fans); if (r != 0) throw new Exception("GetNumFans failed: " + r);
+    return dev;
+  }
+  public static void SetAll(uint pct) {
+    uint n; IntPtr dev = Open(out n);
+    try { for (uint f = 0; f < n; f++) { int r = nvmlDeviceSetFanSpeed_v2(dev, f, pct); if (r != 0) throw new Exception("SetFanSpeed failed: NVML " + r + (r == 4 ? " (needs administrator rights)" : "")); } }
+    finally { nvmlShutdown(); }
+  }
+  public static void SetAuto() {
+    uint n; IntPtr dev = Open(out n);
+    try { for (uint f = 0; f < n; f++) { int r = nvmlDeviceSetDefaultFanSpeed_v2(dev, f); if (r != 0) throw new Exception("SetDefaultFanSpeed failed: NVML " + r + (r == 4 ? " (needs administrator rights)" : "")); } }
+    finally { nvmlShutdown(); }
+  }
+}
+'@
+}
+
+function Set-Fan([string]$FanMode,[int]$Percent) {
+    if (-not $script:isAdmin) { throw 'Fan control needs administrator rights. Press E in the main menu to elevate first.' }
+    Initialize-Nvml
+    if ($FanMode -eq 'manual') { [PearlNvml]::SetAll([uint32]$Percent) } else { [PearlNvml]::SetAuto() }
+}
+
+# --- Fan curve: NVML has no curve API, so a controller window follows the curve in software. ---
+$defaultCurve = '50:35,60:50,70:65,75:75,80:90,85:100'
+$fanStateFile = Join-Path $InstallDir 'fan-controller.json'
+$fanStopFile = Join-Path $InstallDir 'fan-controller.stop'
+
+function ConvertTo-Curve([string]$Text) {
+    $pts = @()
+    foreach ($part in $Text.Split(',')) {
+        $kv = $part.Trim().Split(':')
+        $t = 0; $p = 0
+        if ($kv.Count -ne 2 -or -not [int]::TryParse($kv[0].Trim(),[ref]$t) -or -not [int]::TryParse($kv[1].Trim(),[ref]$p)) {
+            throw "Bad point '$($part.Trim())'. Use temperature:percent, for example 70:65."
+        }
+        if ($t -lt 20 -or $t -gt 95) { throw "Temperature $t C is outside 20..95." }
+        if ($p -lt 30 -or $p -gt 100) { throw "Fan speed $p% is outside 30..100." }
+        $pts += [pscustomobject]@{ Temp=$t; Pct=$p }
+    }
+    if ($pts.Count -lt 2 -or $pts.Count -gt 10) { throw 'Use between 2 and 10 points.' }
+    for ($i = 1; $i -lt $pts.Count; $i++) {
+        if ($pts[$i].Temp -le $pts[$i-1].Temp) { throw 'Temperatures must be strictly increasing.' }
+        if ($pts[$i].Pct -lt $pts[$i-1].Pct) { throw 'Fan speeds must not decrease as temperature rises.' }
+    }
+    if ($pts[$pts.Count-1].Pct -ne 100) { throw 'The last point must be 100% (safety).' }
+    return ,$pts
+}
+
+function Get-CurveSpeed($Pts,[double]$Temp) {
+    if ($Temp -le $Pts[0].Temp) { return [int]$Pts[0].Pct }
+    for ($i = 1; $i -lt $Pts.Count; $i++) {
+        if ($Temp -le $Pts[$i].Temp) {
+            $a = $Pts[$i-1]; $b = $Pts[$i]
+            return [int][Math]::Round($a.Pct + ($b.Pct - $a.Pct) * ($Temp - $a.Temp) / ($b.Temp - $a.Temp))
+        }
+    }
+    return 100
+}
+
+function Write-CurveChart($Pts,$Temp) {
+    Write-Host '  GPU temp   fan speed' -ForegroundColor DarkGray
+    foreach ($pt in $Pts) {
+        $color = 'Green'; if ($pt.Temp -ge 80) { $color = 'Red' } elseif ($pt.Temp -ge 70) { $color = 'Yellow' }
+        Write-Host ('  {0,4} C     {1,3}%  ' -f $pt.Temp,$pt.Pct) -NoNewline -ForegroundColor Gray
+        Write-Host ('#' * [int]($pt.Pct / 4)) -ForegroundColor $color
+    }
+}
+
+function Get-FanControllerActive {
+    if (-not (Test-Path $fanStateFile)) { return $false }
+    try {
+        $j = Get-Content $fanStateFile -Raw | ConvertFrom-Json
+        return (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$j.beat) -lt 15)
+    } catch { return $false }
+}
+
+function Start-FanController {
+    if (Get-FanControllerActive) { Write-Host 'The fan controller is already running.' -ForegroundColor Yellow; return }
+    if (-not $scriptPath) { throw 'Run this from a saved .ps1 file.' }
+    ConvertTo-Curve ([string]$script:cfg.fan_curve) | Out-Null
+    Remove-Item $fanStopFile -Force -ErrorAction SilentlyContinue
+    $sp = @{ FilePath='powershell.exe'; WindowStyle='Normal'; ArgumentList=@(
+        '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptPath + '"'),'-Action','FanControl','-InstallDir',('"' + $InstallDir + '"')) }
+    if (-not $script:isAdmin) { $sp.Verb = 'RunAs'; Write-Host 'Fan control needs administrator rights: approve the Windows prompt.' -ForegroundColor Yellow }
+    Start-Process @sp
+    Write-Host 'Fan controller window opened. Keep it open; press Q in it to return fans to automatic.' -ForegroundColor Green
+}
+
+function Stop-FanController {
+    if (-not (Get-FanControllerActive)) { return }
+    Set-Content $fanStopFile -Value 'stop'
+    for ($i = 0; $i -lt 16 -and (Test-Path $fanStateFile); $i++) { Start-Sleep -Milliseconds 500 }
+    Write-Host 'Fan controller stopped; fans returned to automatic.' -ForegroundColor Green
+}
+
+function Invoke-FanControl {
+    if (-not $script:isAdmin) { throw 'The fan controller needs administrator rights.' }
+    $pts = ConvertTo-Curve ([string]$script:cfg.fan_curve)
+    Initialize-Nvml
+    Remove-Item $fanStopFile -Force -ErrorAction SilentlyContinue
+    # Best effort: also hand the fans back if this window is closed.
+    [void](Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { try { [PearlNvml]::SetAuto() } catch { } })
+    $current = -1; $fails = 0
+    try {
+        while ($true) {
+            if (Test-Path $fanStopFile) { break }
+            $t = $null
+            try { $t = ConvertTo-InvariantDouble (Invoke-Smi 'temperature.gpu'); $fails = 0 } catch { $fails++ }
+            if ($fails -ge 3) { Write-Host 'Cannot read the GPU temperature; returning fans to automatic.' -ForegroundColor Red; break }
+            $target = $current
+            if ($null -ne $t) {
+                $target = Get-CurveSpeed $pts $t
+                if ($t -ge 90) { $target = 100 }
+                $new = $target
+                if ($current -ge 0 -and $target -lt $current) { $new = [Math]::Max($target, $current - 2) }   # ramp down slowly
+                if ($new -ne $current) { Set-Fan 'manual' $new; $current = $new }
+            }
+            @{ pid=$PID; beat=[DateTimeOffset]::UtcNow.ToUnixTimeSeconds() } | ConvertTo-Json | Set-Content $fanStateFile -Encoding ASCII
+            Clear-Host
+            Write-Banner 'Fan curve controller'
+            Write-Host ''
+            Write-CurveChart $pts $t
+            Write-Host ''
+            Write-Host '  GPU ' -NoNewline -ForegroundColor DarkGray
+            Write-Host ('{0:N0} C' -f $t) -NoNewline -ForegroundColor White
+            Write-Host '   fan ' -NoNewline -ForegroundColor DarkGray
+            Write-Host ('{0}%' -f $current) -NoNewline -ForegroundColor Green
+            Write-Host ('   (curve target {0}%)' -f $target) -ForegroundColor DarkGray
+            Write-Host ''
+            Write-Host '  Q: stop and return fans to automatic. Do not just close this window.' -ForegroundColor Yellow
+            for ($i = 0; $i -lt 4; $i++) {
+                if (-not [Console]::IsInputRedirected -and [Console]::KeyAvailable) {
+                    $k = [Console]::ReadKey($true).Key
+                    if ($k -eq [ConsoleKey]::Q -or $k -eq [ConsoleKey]::Escape) { return }
+                }
+                Start-Sleep -Milliseconds 500
+            }
+        }
+    } finally {
+        try { Set-Fan 'auto' 0 } catch { Write-Host "Could not restore automatic fans: $($_.Exception.Message)" -ForegroundColor Red }
+        Remove-Item $fanStateFile,$fanStopFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Set-PowerLimit([double]$Watts) {
     # Changing the limit needs administrator rights: only this one nvidia-smi call is elevated (UAC prompt).
-    $p = Start-Process -FilePath (Find-Smi) -ArgumentList @('-i','0','-pl',[string][int]$Watts) -Verb RunAs -Wait -PassThru -WindowStyle Hidden
+    $sp = @{ FilePath=(Find-Smi); ArgumentList=@('-i','0','-pl',[string][int]$Watts); Wait=$true; PassThru=$true; WindowStyle='Hidden' }
+    if (-not $script:isAdmin) { $sp.Verb = 'RunAs' }
+    $p = Start-Process @sp
     if ($p.ExitCode -ne 0) { throw "nvidia-smi exited with code $($p.ExitCode); the power limit was not changed." }
     $now = (Get-PowerInfo).Limit
     Write-Host ('Power limit is now {0:N0} W (resets to default after a reboot or driver reload).' -f $now) -ForegroundColor Green
@@ -321,13 +496,36 @@ function Write-BoxLine([string]$Text,[string]$Color) {
     Write-Host '|' -ForegroundColor DarkCyan
 }
 
+function Test-Admin {
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Write-Banner([string]$Subtitle) {
     $rule = '  +' + ('-' * 54) + '+'
     Write-Host ''
     Write-Host $rule -ForegroundColor DarkCyan
     Write-BoxLine ('PEARL-POW (PRL)  *  KRig {0}' -f $version) 'Cyan'
-    if ($Subtitle) { Write-BoxLine $Subtitle 'DarkGray' }
+    # Status line: subtitle on the left, elevation badge on the right (green = admin, orange = not).
+    $badge = ' NOT ELEVATED '; $bg = 'DarkYellow'; $fg = 'Black'
+    if ($script:isAdmin) { $badge = ' ELEVATED '; $bg = 'DarkGreen'; $fg = 'White' }
+    $avail = 52 - $badge.Length
+    $sub = $Subtitle
+    if ($sub.Length -gt $avail) { $sub = $sub.Substring(0,$avail) }
+    Write-Host '  |' -ForegroundColor DarkCyan -NoNewline
+    Write-Host (' ' + $sub.PadRight($avail)) -ForegroundColor DarkGray -NoNewline
+    Write-Host $badge -ForegroundColor $fg -BackgroundColor $bg -NoNewline
+    Write-Host ' ' -NoNewline
+    Write-Host '|' -ForegroundColor DarkCyan
     Write-Host $rule -ForegroundColor DarkCyan
+}
+
+function Start-Elevated {
+    if ($script:isAdmin) { Write-Host 'Already running as administrator.' -ForegroundColor Green; return $false }
+    if (-not $scriptPath) { throw 'Cannot elevate: run this from a saved .ps1 file.' }
+    Start-Process -FilePath powershell.exe -Verb RunAs -ArgumentList @(
+        '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptPath + '"'),'-InstallDir',('"' + $InstallDir + '"'))
+    Write-Host 'Administrator window opened. This menu will close; the miner (if running) is not affected.' -ForegroundColor Green
+    return $true
 }
 
 function New-MenuItem([string]$Key,[string]$Label,[string]$Tag = '',[string]$TagColor = 'Gray') {
@@ -425,6 +623,15 @@ function Show-GpuSettings {
         Write-Host '  Offsets      ' -NoNewline -ForegroundColor DarkGray
         Write-Host ('core {0:+#;-#;0} MHz | memory {1:+#;-#;0} MHz' -f $co,$mo) -NoNewline -ForegroundColor Yellow
         Write-Host '   (applied at miner start)' -ForegroundColor DarkGray
+        $ctl = Get-FanControllerActive
+        $fanMode = 'automatic'
+        if ($script:cfg.fan_mode -eq 'manual') { $fanMode = 'manual ' + [int]$script:cfg.fan_percent + '%' }
+        elseif ($script:cfg.fan_mode -eq 'curve') { $fanMode = 'custom curve' }
+        $tempColor = 'Green'; if ($pi.Temp -ge 83) { $tempColor = 'Red' } elseif ($pi.Temp -ge 75) { $tempColor = 'Yellow' }
+        Write-Host '  Fans         ' -NoNewline -ForegroundColor DarkGray
+        Write-Host ('{0:N0}%' -f $pi.Fan) -NoNewline -ForegroundColor White
+        Write-Host ('  ({0})   GPU ' -f $fanMode) -NoNewline -ForegroundColor DarkGray
+        Write-Host ('{0:N0} C' -f $pi.Temp) -ForegroundColor $tempColor
         Write-Host ''
         $items = @(
             New-MenuItem '1' 'Set power limit' ('{0:N0} W' -f $pi.Limit) 'Yellow'
@@ -433,11 +640,15 @@ function Show-GpuSettings {
             New-MenuItem '4' 'Memory clock offset' ('{0:+#;-#;0} MHz' -f $mo) 'Yellow'
             New-MenuItem '5' 'Clear both offsets'
             New-MenuItem '6' 'Offset limits' ('core {0}..{1}  mem {2}..{3}' -f [int]$script:cfg.core_min,[int]$script:cfg.core_max,[int]$script:cfg.mem_min,[int]$script:cfg.mem_max) 'DarkGray'
+            New-MenuItem '7' 'Fans: automatic (driver curve)' $(if ($script:cfg.fan_mode -eq 'auto') { 'ACTIVE' } else { '' }) 'Green'
+            New-MenuItem '8' 'Fans: manual speed' $(if ($script:cfg.fan_mode -eq 'manual') { '{0}%' -f [int]$script:cfg.fan_percent } else { '' }) 'Yellow'
+            New-MenuItem '9' 'Fans: custom temperature curve' $(if ($ctl) { 'RUNNING' } elseif ($script:cfg.fan_mode -eq 'curve') { 'stopped' } else { '' }) 'Green'
+            New-MenuItem 'C' 'Edit fan curve' ([string]$script:cfg.fan_curve.Split(',').Count + ' points') 'DarkGray'
             New-MenuItem '0' 'Back'
         )
         $c = Select-Menu 'gpu' $items
         Write-Host ''
-        if ($c -ne '0') { Write-Host '  Power limit and offsets need administrator approval (Windows prompt).' -ForegroundColor DarkYellow }
+        if ($c -ne '0' -and -not $script:isAdmin) { Write-Host '  Power limit and offsets ask for administrator approval; fan control needs an elevated menu (press E in the main menu).' -ForegroundColor DarkYellow }
         try {
             switch ($c) {
                 '1' {
@@ -450,6 +661,39 @@ function Show-GpuSettings {
                 '4' { $script:cfg.mem_offset = Read-Offset 'Memory' ([int]$script:cfg.mem_min) ([int]$script:cfg.mem_max); Save-Config; Invoke-OffsetRestart }
                 '5' { $script:cfg.core_offset = 0; $script:cfg.mem_offset = 0; Save-Config; Invoke-OffsetRestart }
                 '6' { Set-OffsetLimits }
+                '7' {
+                    Stop-FanController
+                    Set-Fan 'auto' 0
+                    $script:cfg.fan_mode = 'auto'; Save-Config
+                    Write-Host 'Fans returned to the automatic driver curve.' -ForegroundColor Green
+                }
+                '8' {
+                    if (-not $script:isAdmin) { throw 'Fan control needs administrator rights. Press E in the main menu to elevate first.' }
+                    $pct = Read-Limit 'Fan speed (%)' ([int]$script:cfg.fan_percent) 30 100
+                    Stop-FanController
+                    Set-Fan 'manual' $pct
+                    $script:cfg.fan_mode = 'manual'; $script:cfg.fan_percent = $pct; Save-Config
+                    Write-Host "Fans set to $pct% (manual). Watch the GPU temperature: no automatic cooling now." -ForegroundColor Yellow
+                }
+                '9' {
+                    $script:cfg.fan_mode = 'curve'; Save-Config
+                    Start-FanController
+                }
+                'C' {
+                    $pts = ConvertTo-Curve ([string]$script:cfg.fan_curve)
+                    Write-CurveChart $pts $null
+                    Write-Host ''
+                    Write-Host "  Current: $($script:cfg.fan_curve)"
+                    Write-Host '  Format: temp:percent,temp:percent,...  (2-10 points; 30-100%; last point must be 100%)' -ForegroundColor DarkGray
+                    $v = (Read-Host 'New curve (Enter = keep, "default" = reset)').Trim()
+                    if ($v) {
+                        if ($v -eq 'default') { $v = $defaultCurve }
+                        [void](ConvertTo-Curve $v)
+                        $script:cfg.fan_curve = $v; Save-Config
+                        Write-Host 'Curve saved.' -ForegroundColor Green
+                        if (Get-FanControllerActive) { Write-Host 'Restart the fan controller (Q in its window, then option 9) to use it.' -ForegroundColor Yellow }
+                    }
+                }
                 '0' { return }
                 default { Write-Host 'Invalid choice.' -ForegroundColor Red }
             }
@@ -551,6 +795,7 @@ function Show-Menu {
         Write-Host ''
         $su = 'OFF'; $suColor = 'DarkGray'; if ($script:cfg.startup) { $su = 'ON'; $suColor = 'Green' }
         $as = 'OFF'; $asColor = 'DarkGray'; if ($script:cfg.autostart) { $as = 'ON'; $asColor = 'Green' }
+        $elTag = 'not admin'; $elColor = 'DarkYellow'; if ($script:isAdmin) { $elTag = 'ACTIVE'; $elColor = 'Green' }
         $items = @(
             New-MenuItem '1' 'Start miner'
             New-MenuItem '2' 'Stop miner'
@@ -561,6 +806,7 @@ function Show-Menu {
             New-MenuItem '7' 'Put in Documents (1_pearl_miner)'
             New-MenuItem '8' 'GPU settings (power, clock offsets)'
             New-MenuItem '9' 'Update script from GitHub'
+            New-MenuItem 'E' 'Elevate (restart as administrator)' $elTag $elColor
             New-MenuItem '0' 'Exit menu (miner keeps running)'
         )
         $c = Select-Menu 'main' $items
@@ -601,6 +847,7 @@ function Show-Menu {
                 '7' { Install-ToDocuments }
                 '8' { Show-GpuSettings; $pause = $false }
                 '9' { Start-SelfUpdate; Start-Sleep -Seconds 1; return }
+                'E' { if (Start-Elevated) { Start-Sleep -Seconds 1; return } }
                 '0' { return }
                 default { Write-Host 'Invalid choice.' -ForegroundColor Red }
             }
@@ -609,6 +856,11 @@ function Show-Menu {
     }
 }
 
+$script:isAdmin = Test-Admin
+# A window opened directly as powershell.exe uses the blue PowerShell palette; force black.
+if (-not [Console]::IsInputRedirected) {
+    try { $Host.UI.RawUI.BackgroundColor = 'Black'; $Host.UI.RawUI.ForegroundColor = 'Gray'; Clear-Host } catch { }
+}
 if ($Action -eq 'Update') { Invoke-SelfUpdate; return }
 if (-not [Environment]::Is64BitOperatingSystem) { throw 'Windows x64 is required.' }
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
@@ -622,6 +874,7 @@ switch ($Action) {
     'Stop'    { Stop-Miner }
     'Summary' { Show-Summary }
     'Install' { Install-ToDocuments }
+    'FanControl' { Invoke-FanControl }
     default {
         if ($Boot -and $script:cfg.autostart) {
             # Give the NVIDIA driver and network a moment after logon.
