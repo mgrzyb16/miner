@@ -152,9 +152,16 @@ function Start-Miner {
     $logDir = Join-Path $InstallDir ('logs\' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + "-$m-$w-$RunLabel")
     New-Item -ItemType Directory $logDir -Force | Out-Null
     $nativeLog = Join-Path $logDir 'miner.log'
+    # Record the tuning in effect so overnight logs can be matched to settings later.
+    $powerLimit = $null; $powerDefault = $null
+    try { $pw = Get-PowerInfo; $powerLimit = $pw.Limit; $powerDefault = $pw.Default } catch { }
     @{started_at=(Get-Date).ToString('o');computer=$env:COMPUTERNAME;worker=$w;mode=$m;
         run_label=$RunLabel;mining_username=$user;login=$login;pool=$pool;miner_version=$version;
-        gpu=$cards[0].name.Trim();driver=$cards[0].driver.Trim();log_level=$LogLevel} |
+        gpu=$cards[0].name.Trim();driver=$cards[0].driver.Trim();log_level=$LogLevel;
+        power_limit_w=$powerLimit;power_default_w=$powerDefault;
+        core_offset_mhz=[int]$script:cfg.core_offset;mem_offset_mhz=[int]$script:cfg.mem_offset;
+        fan_mode=[string]$script:cfg.fan_mode;fan_percent=[int]$script:cfg.fan_percent;fan_curve=[string]$script:cfg.fan_curve;
+        elevated=$script:isAdmin} |
         ConvertTo-Json | Set-Content (Join-Path $logDir 'session.json') -Encoding UTF8
     # ArgumentList is joined by Start-Process on Windows; only path needs quotes.
     # The HTTP API binds to 127.0.0.1 only and feeds the live summary (option 3).
