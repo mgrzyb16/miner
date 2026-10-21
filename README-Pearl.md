@@ -23,15 +23,32 @@ Set your payout address in your Kryptex account; the script never handles wallet
 | 7 | Earnings yield | Your BTC per TH/s per day. The miner API reports hashrate but not earnings, so the BTC estimate is hashrate x this number. Until set, the summary says so. Real balance is in the Kryptex dashboard. |
 | 8 | GPU settings | Power limit and clock offsets (see below). |
 | 9 | Update script from GitHub | Opens an updater window, replaces the script, restarts the menu (see below). |
+| A | Remote agent: set up | Asks for the fleet server URL and the rig key (stored DPAPI-encrypted for your Windows user in `agent-key.dat`) and registers the scheduled task `Pearl Agent` (at logon, elevated; one Windows prompt). The agent reports every few seconds and applies the power limit, offsets and fans set on the server. While it runs, server settings override changes made in this menu, and option 9 is disabled. |
+| R | Remote agent: remove | Stops the agent cleanly and removes the scheduled task. The URL and key stay saved. |
 | W | Worker name suffix | Text added to the end of the default worker name (`pps`/`solo` + PC name + suffix), 1-12 letters or numbers, `-` clears it. Use it to split PCs that share a name without renaming Windows. Offers to restart a running miner so the new worker name takes effect. Kryptex worker names are Latin letters and numbers, max 32 characters; the PC name is trimmed to fit the suffix. An explicit `-Worker` overrides it. |
 | N | Rename this PC | Asks for a new Windows computer name (1-15 letters, numbers or hyphens) and renames the PC after a Windows administrator prompt. Only that one command is elevated. Reboot yourself afterwards; the menu shows `OLD -> NEW` until you do. The default worker name uses the PC name, so restart the miner after the reboot. Not for domain-joined PCs. |
 | D | Put in Documents | Copies the script (and README) into `Documents\1_pearl_miner` and writes fresh `.cmd` launchers there. Works with a OneDrive-redirected Documents folder. |
 | 0 | Exit menu | Miner keeps running. |
 
+## Unattended rigs (remote agent, version with the watchdog)
+
+New command-line actions, for PCs managed from the fleet dashboard (details and the full checklist: `docs/ONBOARDING.md`):
+
+```powershell
+.\Start-Pearl.ps1 -Action Setup -ServerUrl https://mining.example.com -MiningUsername krxNAME [-Mode PPS] [-WorkerSuffix b] [-Harden] [-AllowAutoReboot]   # key in $env:PEARL_RIG_KEY
+.\Start-Pearl.ps1 -Action Check                      # read-only: is this PC ready to mine unattended?
+.\Start-Pearl.ps1 -Action Harden [-DryRun]           # Windows Update, restarts, sleep (reversible; -DryRun only prints)
+.\Start-Pearl.ps1 -Action Unharden                   # puts every hardened setting back
+```
+
+With the agent set up, "mining is wanted" is remembered (menu start and the dashboard's start/restart set it; a stop clears it) and the agent's watchdog restarts a wanted miner that died or stopped hashing (at most 3 times an hour; an optional last-resort PC reboot with `-AllowAutoReboot`). Option 6 (auto-start) is replaced by this on agent rigs.
+
 ## GPU settings (option 8)
 
 - **Power limit** is shown with current draw, default and allowed range. Setting it runs `nvidia-smi -pl` and asks for administrator approval through a Windows prompt (only that one call is elevated). The limit resets after a reboot or driver reload.
 - **Core and memory offsets** cannot be set with nvidia-smi. They are saved in `config.json` and passed to KRig (`--gpu-coffset`, `--gpu-moffset`) the next time the miner starts, and KRig resets them when it exits. Allowed ranges: core -500..+300 MHz, memory -1000..+1500 MHz. Unstable values crash the miner; change in small steps. Clearing the offsets removes them from the next start.
+- **Saved power limit:** a limit set here (or by the remote agent) is saved in `config.json` and reapplied each time the miner starts, so it survives reboots. "Reset to default" clears it.
+- **FanControl app (options X, I, O):** `I` installs [FanControl](https://getfancontrol.com) with winget after you confirm (`winget install --id Rem0o.FanControl --exact ...`), `O` opens it, `X` hands the fans to it: this script and the remote agent then never set fan speed (server fan settings are ignored). If FanControl runs while fans here are manual or curve, the screen warns that two programs would fight over the fan.
 
 ## Modes and worker names
 
