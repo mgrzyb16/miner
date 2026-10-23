@@ -2,7 +2,7 @@
 <# Pearl-POW / PRL, one RTX 4090 per Windows 11 PC.
    Interactive menu: start/stop the miner, live summary, optional Windows startup.
    The miner runs in its own console window; closing this menu never stops it.
-   Nothing starts automatically unless you enable option 6.
+   Nothing starts automatically unless you switch it on in menu S (System & auto-start).
    Downloads KRig 1.5.9 from its publisher and verifies the pinned SHA-256.
    Does not change GPU tuning, antivirus, firewall, or power settings.
    Options 5/6 create (or remove) one shortcut in your per-user Startup folder.
@@ -18,7 +18,10 @@ param(
     [ValidateRange(0,1000)][double]$BtcPerTHDay = 0,
     [ValidateSet('info','debug')][string]$LogLevel = 'info',
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'PearlMining'),
-    [ValidateSet('Menu','Start','Stop','Summary','Install','Update','FanControl','Agent','Setup','Harden','Unharden','Check')][string]$Action = 'Menu',
+    [ValidateSet('Menu','Start','Stop','Summary','Install','Update','FanControl','Agent','Setup','Harden','Unharden','Check','WinSet')][string]$Action = 'Menu',
+    [string]$Setting,            # with -Action WinSet: one row of menu S (autologin, updates, restarts, drivers, sleep, faststartup, powersave)
+    [ValidateSet('on','off')][string]$Value,
+    [string]$AutoLoginUser,      # the account auto-login signs in; the non-elevated menu passes its own (default: this user)
     [string]$UpdateUrl = 'https://raw.githubusercontent.com/mgrzyb16/miner/main/Start-Pearl.ps1',
     [int]$ParentPid = 0,
     [string]$UpdateTarget,
@@ -53,13 +56,15 @@ $script:agentMode = $false   # true inside the remote agent: Start-Miner leaves 
 $script:ag = $null           # remote agent state
 
 # power_limit_w: saved power limit in W (0 = leave the driver default); reapplied at every miner start.
+# mem_lock: memory clock lock in MHz (0 = not locked); applied by KRig at miner start like the offsets.
+# core_lock: core clock lock in MHz (0 = not locked; KRig --gpu-cclock); local only, the dashboard does not set it yet.
 # server_url / temp_cutoff_c: remote agent (the rig key is stored separately, DPAPI-protected, in agent-key.dat).
 function Get-Config {
-    $c = [ordered]@{ mining_username=''; mode='PPS'; startup=$false; autostart=$false; btc_per_th_day=0.0; api_port=12000; core_offset=0; mem_offset=0
+    $c = [ordered]@{ mining_username=''; mode='PPS'; startup=$false; autostart=$false; btc_per_th_day=0.0; api_port=12000; core_offset=0; mem_offset=0; mem_lock=0; core_lock=0
            core_min=-500; core_max=300; mem_min=-1000; mem_max=1500; worker_suffix=''
            fan_mode='auto'; fan_percent=60; fan_curve='50:35,60:50,70:65,75:75,80:90,85:100'
            power_limit_w=0; server_url=''; temp_cutoff_c=85
-           miner_wanted=$false; watchdog='restart' }
+           miner_wanted=$false; miner_wanted_by=''; watchdog='restart' }   # miner_wanted_by: 'dashboard' when a dashboard command set it last
     if (Test-Path $configFile) {
         $saved = Get-Content $configFile -Raw | ConvertFrom-Json
         foreach ($p in $saved.PSObject.Properties) { if ($c.Contains($p.Name)) { $c[$p.Name] = $p.Value } }
@@ -149,10 +154,104 @@ function Get-DefaultWorker([string]$m) {
     return $base + $sfx
 }
 
+# ---- Mining profiles (chosen on the dashboard) and the miners this PC approved ----
+# The dashboard never names a program. A profile names a miner id; it runs only if that id is on this PC's allow-list:
+# built-in KRig (pinned above), plus miners.json in the administrator-owned agent folder, written only from the elevated
+# menu (M), each entry pinned by SHA-256. The argument template is plain tokens with placeholders; everything is re-checked here.
+$minersFile = Join-Path (Join-Path $env:ProgramFiles 'PearlAgent') 'miners.json'
+$profilePlaceholders = @('user','worker','login','pool','pool_host','api_port','log','coffset','moffset','mclock')   # pool_host = host:port, no scheme
+$profileTokenRe = '^[A-Za-z0-9_\-.:/=,+@]*$'
+
+function Get-ApprovedMiners {
+    $list = New-Object System.Collections.ArrayList
+    [void]$list.Add([ordered]@{ id='krig'; name="KRig $version"; exe=(Join-Path $InstallDir "krig-$version\krig-miner.exe"); sha256=''; process='krig-miner'; stats='krig' })
+    foreach ($e in @(Read-JsonFile $minersFile)) {
+        if ($null -eq $e) { continue }
+        $id = [string]$e.id; $exe = [string]$e.exe; $sha = [string]$e.sha256; $st = [string]$e.stats
+        if ($id -notmatch '^[a-z0-9][a-z0-9_.-]{0,31}$' -or $id -eq 'krig') { continue }
+        if (-not [IO.Path]::IsPathRooted($exe) -or $exe -notmatch '\.exe$' -or $sha -notmatch '^[0-9A-Fa-f]{64}$') { continue }
+        if ($st -notin @('krig','none')) { $st = 'none' }
+        [void]$list.Add([ordered]@{ id=$id; name=(Limit-Text ([string]$e.name) 64); exe=$exe; sha256=$sha.ToUpperInvariant()
+            process=[IO.Path]::GetFileNameWithoutExtension($exe); stats=$st })
+    }
+    return ,$list
+}
+
+# '' when the profile may run here, else why not (the server checks the same rules; it is not trusted to).
+function Test-ProfileShape($P) {
+    if ($null -eq $P) { return 'no profile' }
+    if ($null -eq (ConvertTo-NullableInt $P.id) -or (ConvertTo-NullableInt $P.id) -le 0) { return 'invalid profile id' }
+    if ([string]$P.miner -notmatch '^[a-z0-9][a-z0-9_.-]{0,31}$') { return 'invalid miner id' }
+    if ([string]$P.pool_url -notmatch '^(stratum\+(tcp|ssl|tls)|stratum|tcp|ssl)://[A-Za-z0-9.\-]{1,200}:\d{1,5}$') { return 'invalid pool URL' }
+    if ([string]$P.account -notmatch '^[A-Za-z0-9._\-]{1,120}$') { return 'invalid account' }
+    if ([string]$P.mode -notin @('PPS','SOLO','')) { return 'invalid mode' }
+    if ([string]$P.worker -notmatch '^[A-Za-z0-9_\-]{0,32}$') { return 'invalid worker' }
+    $tmpl = [string]$P.args
+    if ($tmpl.Length -gt 600) { return 'arguments too long' }
+    $tokens = @($tmpl.Trim() -split '\s+' | Where-Object { $_ })
+    if ($tokens.Count -eq 0 -or $tokens.Count -gt 40) { return 'arguments: 1-40 words' }
+    foreach ($t in $tokens) {
+        foreach ($m in [regex]::Matches($t, '\{([a-z_]+)\}')) { if ($m.Groups[1].Value -notin $profilePlaceholders) { return "unknown placeholder {$($m.Groups[1].Value)}" } }
+        if (($t -replace '\{[a-z_]+\}', '') -notmatch $profileTokenRe) { return "argument '$(Limit-Text $t 40)' has a character that is not allowed" }
+    }
+    if ($tmpl -notmatch '\{pool(_host)?\}' -or $tmpl -notmatch '\{(login|user)\}') { return 'arguments must contain {pool} (or {pool_host}) and {login} or {user}' }
+    return ''
+}
+
+# The template filled in, one array element per word. Values are this agent's own validated ones; only a path can hold a space.
+function ConvertTo-MinerArgs([string]$Template,[hashtable]$Values) {
+    $out = @()
+    foreach ($t in @($Template.Trim() -split '\s+' | Where-Object { $_ })) {
+        $v = [regex]::Replace($t, '\{([a-z_]+)\}', { param($m) [string]$Values[$m.Groups[1].Value] })
+        if ($v -match '"') { throw 'a placeholder value contains a quote' }
+        if ($v -match '\s') { $v = '"' + $v + '"' }
+        $out += $v
+    }
+    return ,$out
+}
+
+# Which GPU settings the active miner takes: KRig always (flags added by this script); other miners only through their placeholders.
+function Get-ProfileSupport($P,$Miner) {
+    if ((-not $P) -or ($Miner.id -eq 'krig')) { return @{ core=$true; mem=$true; lock=$true } }
+    $a = [string]$P.args
+    return @{ core=($a -match '\{coffset\}'); mem=($a -match '\{moffset\}'); lock=($a -match '\{mclock\}') }
+}
+
+function Get-ActiveProfile {
+    # $null = the local config (KRig with the saved username and mode). Written by the agent when the dashboard assigns a profile.
+    $p = Read-JsonFile (Get-AgentFile 'profile.json')
+    if ($p -and [string]$p.hash -match '^[a-z0-9]{1,16}$' -and -not (Test-ProfileShape $p)) { return $p }
+    return $null
+}
+
+function Get-ActiveMiner {
+    $all = Get-ApprovedMiners
+    $p = Get-ActiveProfile
+    if ($p) { foreach ($m in $all) { if ($m.id -eq [string]$p.miner) { return $m } } }
+    return $all[0]
+}
+
+function Get-MinerProcessName { return [string](Get-ActiveMiner).process }
+function Get-MinerProcess { return @(Get-Process -Name (Get-MinerProcessName) -ErrorAction SilentlyContinue) }
+
+# The approved miner a profile names, with its exe verified against the pin. Throws with the reason.
+function Resolve-ProfileMiner($P) {
+    $err = Test-ProfileShape $P
+    if ($err) { throw "profile refused: $err" }
+    $mi = $null
+    foreach ($m in (Get-ApprovedMiners)) { if ($m.id -eq [string]$P.miner) { $mi = $m } }
+    if (-not $mi) { throw "miner '$($P.miner)' is not approved on this PC (menu M adds it)" }
+    if ($mi.id -ne 'krig') {
+        if (-not (Test-Path -LiteralPath $mi.exe)) { throw "approved miner '$($mi.id)' is missing: $($mi.exe)" }
+        if ((Get-FileHash -LiteralPath $mi.exe -Algorithm SHA256).Hash -ne $mi.sha256) { throw "miner '$($mi.id)' changed since it was approved (SHA-256 differs); approve it again in menu M" }
+    }
+    return $mi
+}
+
 # -NonInteractive (remote agent): never prompts; throws instead of asking for a username or a UAC approval.
 function Start-Miner([string]$StartMode,[switch]$NonInteractive) {
     if (Test-DryRunSkip 'start the miner') { return }
-    if (Get-Process -Name krig-miner -ErrorAction SilentlyContinue) {
+    if (Get-MinerProcess) {
         Write-Host 'Miner is already running.' -ForegroundColor Yellow
         return
     }
@@ -165,37 +264,52 @@ function Start-Miner([string]$StartMode,[switch]$NonInteractive) {
     }
     Write-Host "GPU: $($cards[0].name.Trim()) | Driver: $($cards[0].driver.Trim())"
 
-    $user = $MiningUsername
-    if (-not $user -and -not $ResetAccount) { $user = [string]$script:cfg.mining_username }
-    if (-not $user) {
-        if ($NonInteractive) { throw 'No Kryptex Mining Username is saved. Start the miner once from the menu first.' }
-        $user = Read-Host 'Paste your Kryptex Mining Username (krx...), NOT a BTC/PRL address'
-    }
-    $user = $user.Trim()
-    if ($user -notmatch '^krx[A-Za-z0-9]+$') {
-        throw 'Expected your Kryptex Mining Username beginning krx. Do not include solo:, a worker suffix, password or wallet address.'
-    }
-    $m = $StartMode
-    if (-not $m) { $m = $Mode }
-    if (-not $m) { $m = [string]$script:cfg.mode }
-    $m = $m.ToUpperInvariant()
-    if ($m -eq 'PPS+') { $m = 'PPS' }
-    if ($m -notin @('PPS','SOLO')) { throw 'Invalid saved mode. Supply -Mode PPS or -Mode SOLO.' }
-    $w = $Worker
-    if (-not $w) { $w = Get-DefaultWorker $m }
-    if ($w -notmatch '^[A-Za-z0-9]{1,32}$') { throw 'Worker must contain 1-32 letters or numbers.' }
+    # A mining profile from the dashboard (profile.json) replaces the saved account, mode, pool and miner; the local config stays as it is.
+    $prof = Get-ActiveProfile
+    $mi = $null
+    $poolUrl = $pool
     if ($RunLabel -notmatch '^[A-Za-z0-9_-]{1,64}$') { throw 'RunLabel must contain 1-64 letters, numbers, underscores or hyphens.' }
-    $script:cfg.mining_username = $user
-    $script:cfg.mode = $m
-    Save-Config
-    $script:MiningUsername = $null
-    $script:ResetAccount = $false
+    if ($prof) {
+        $mi = Resolve-ProfileMiner $prof
+        $user = [string]$prof.account
+        $m = [string]$prof.mode
+        $w = [string]$prof.worker
+        if (-not $w) { $w = Get-DefaultWorker $(if ($m) { $m } else { 'PPS' }) }
+        $poolUrl = [string]$prof.pool_url
+        Write-Host "Profile: $($prof.name) | Miner: $($mi.name)" -ForegroundColor Cyan
+    } else {
+        $user = $MiningUsername
+        if (-not $user -and -not $ResetAccount) { $user = [string]$script:cfg.mining_username }
+        if (-not $user) {
+            if ($NonInteractive) { throw 'No Kryptex Mining Username is saved. Start the miner once from the menu first.' }
+            $user = Read-Host 'Paste your Kryptex Mining Username (krx...), NOT a BTC/PRL address'
+        }
+        $user = $user.Trim()
+        if ($user -notmatch '^krx[A-Za-z0-9]+$') {
+            throw 'Expected your Kryptex Mining Username beginning krx. Do not include solo:, a worker suffix, password or wallet address.'
+        }
+        $m = $StartMode
+        if (-not $m) { $m = $Mode }
+        if (-not $m) { $m = [string]$script:cfg.mode }
+        $m = $m.ToUpperInvariant()
+        if ($m -eq 'PPS+') { $m = 'PPS' }
+        if ($m -notin @('PPS','SOLO')) { throw 'Invalid saved mode. Supply -Mode PPS or -Mode SOLO.' }
+        $w = $Worker
+        if (-not $w) { $w = Get-DefaultWorker $m }
+        if ($w -notmatch '^[A-Za-z0-9]{1,32}$') { throw 'Worker must contain 1-32 letters or numbers.' }
+        $script:cfg.mining_username = $user
+        $script:cfg.mode = $m
+        Save-Config
+        $script:MiningUsername = $null
+        $script:ResetAccount = $false
+    }
     $login = "$user/$w"
     if ($m -eq 'SOLO') { $login = 'solo:' + $login }
-    Write-Host "Mode: $m | Worker: $w | Login: $login | BTC auto-conversion"
+    $modeText = $m; if (-not $modeText) { $modeText = 'none' }
+    Write-Host "Mode: $modeText | Worker: $w | Login: $login | Pool: $poolUrl"
 
-    $exe = Install-Miner
-    $logDir = Join-Path $InstallDir ('logs\' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + "-$m-$w-$RunLabel")
+    if ($mi -and $mi.id -ne 'krig') { $exe = $mi.exe } else { $exe = Install-Miner }
+    $logDir = Join-Path $InstallDir ('logs\' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + "-$modeText-$w-$RunLabel")
     New-Item -ItemType Directory $logDir -Force | Out-Null
     $nativeLog = Join-Path $logDir 'miner.log'
     # The driver forgets the power limit on reboot: reapply the saved one (GPU settings or the remote agent set it).
@@ -212,24 +326,42 @@ function Start-Miner([string]$StartMode,[switch]$NonInteractive) {
     # Record the tuning in effect so overnight logs can be matched to settings later.
     $powerLimit = $null; $powerDefault = $null
     try { $pw = Get-PowerInfo; $powerLimit = $pw.Limit; $powerDefault = $pw.Default } catch { }
-    @{started_at=(Get-Date).ToString('o');computer=$env:COMPUTERNAME;worker=$w;mode=$m;
-        run_label=$RunLabel;mining_username=$user;login=$login;pool=$pool;miner_version=$version;
+    $minerName = $version; if ($mi) { $minerName = $mi.name }
+    $profName = ''; if ($prof) { $profName = [string]$prof.name }
+    @{started_at=(Get-Date).ToString('o');computer=$env:COMPUTERNAME;worker=$w;mode=$m;profile=$profName;
+        run_label=$RunLabel;mining_username=$user;login=$login;pool=$poolUrl;miner_version=$minerName;
         gpu=$cards[0].name.Trim();driver=$cards[0].driver.Trim();log_level=$LogLevel;
         power_limit_w=$powerLimit;power_default_w=$powerDefault;
-        core_offset_mhz=[int]$script:cfg.core_offset;mem_offset_mhz=[int]$script:cfg.mem_offset;
+        core_offset_mhz=[int]$script:cfg.core_offset;mem_offset_mhz=[int]$script:cfg.mem_offset;mem_lock_mhz=[int]$script:cfg.mem_lock;core_lock_mhz=[int]$script:cfg.core_lock;
         fan_mode=[string]$script:cfg.fan_mode;fan_percent=[int]$script:cfg.fan_percent;fan_curve=[string]$script:cfg.fan_curve;
         elevated=$script:isAdmin} |
         ConvertTo-Json | Set-Content (Join-Path $logDir 'session.json') -Encoding UTF8
     # ArgumentList is joined by Start-Process on Windows; only path needs quotes.
     # The HTTP API binds to 127.0.0.1 only and feeds the live summary (option 4).
-    $argsList = @('--coin','pearl','--url',$pool,'--user',$login,'--no-rocm','--no-tui',
-                  '--log-level',$LogLevel,'--log-file',('"' + $nativeLog + '"'),
-                  '--api-port',[string]$script:cfg.api_port,'--api-host','127.0.0.1')
-    # Clock offsets are applied by KRig itself (nvidia-smi cannot set offsets); it resets them on exit.
-    if ([int]$script:cfg.core_offset -ne 0) { $argsList += "--gpu-coffset=$([int]$script:cfg.core_offset)" }
-    if ([int]$script:cfg.mem_offset -ne 0) { $argsList += "--gpu-moffset=$([int]$script:cfg.mem_offset)" }
+    $co = [int]$script:cfg.core_offset; $mo = [int]$script:cfg.mem_offset; $ml = [int]$script:cfg.mem_lock; $cl = [int]$script:cfg.core_lock
+    if ($prof) {
+        $vals = @{ user=$user; worker=$w; login=$login; pool=$poolUrl; pool_host=($poolUrl -replace '^[a-z+]+://',''); api_port=[string][int]$script:cfg.api_port; log=$nativeLog
+                   coffset=[string]$co; moffset=[string]$mo; mclock=[string]$ml }
+        $argsList = ConvertTo-MinerArgs ([string]$prof.args) $vals
+        # Settings the miner cannot take (no placeholder) are left out, so they also do not need administrator rights.
+        $sup = Get-ProfileSupport $prof $mi
+        if (-not $sup.core) { $co = 0 }; if (-not $sup.mem) { $mo = 0 }; if (-not $sup.lock) { $ml = 0 }
+    } else {
+        $argsList = @('--coin','pearl','--url',$pool,'--user',$login,'--no-rocm','--no-tui',
+                      '--log-level',$LogLevel,'--log-file',('"' + $nativeLog + '"'),
+                      '--api-port',[string]$script:cfg.api_port,'--api-host','127.0.0.1')
+    }
+    # Clock offsets and the memory clock lock are applied by KRig itself (nvidia-smi cannot set offsets); it resets them on exit.
+    # Another miner gets them only through its own {coffset} {moffset} {mclock} placeholders.
+    if (-not $mi -or $mi.id -eq 'krig') {
+        $tmpl = ''; if ($prof) { $tmpl = [string]$prof.args }
+        if ($co -ne 0 -and $tmpl -notmatch '\{coffset\}') { $argsList += "--gpu-coffset=$co" }
+        if ($mo -ne 0 -and $tmpl -notmatch '\{moffset\}') { $argsList += "--gpu-moffset=$mo" }
+        if ($ml -gt 0 -and $tmpl -notmatch '\{mclock\}') { $argsList += "--gpu-mclock=$ml" }
+        if ($cl -gt 0) { $argsList += "--gpu-cclock=$cl" }
+    } else { $cl = 0 }   # other miners: no core lock (no placeholder for it yet)
     $sp = @{ FilePath=$exe; WorkingDirectory=(Split-Path $exe); ArgumentList=$argsList; WindowStyle='Normal'; PassThru=$true }
-    if (-not $script:isAdmin -and ([int]$script:cfg.core_offset -ne 0 -or [int]$script:cfg.mem_offset -ne 0)) {
+    if (-not $script:isAdmin -and ($co -ne 0 -or $mo -ne 0 -or $ml -gt 0 -or $cl -gt 0)) {
         # NVML refuses clock offsets without administrator rights ("Insufficient Permissions").
         if ($NonInteractive) { throw 'Clock offsets need administrator rights; run the agent elevated.' }
         $sp.Verb = 'RunAs'
@@ -237,7 +369,20 @@ function Start-Miner([string]$StartMode,[switch]$NonInteractive) {
     }
     $p = Start-Process @sp
     Write-Host "Miner started in its own window (PID $($p.Id)). Logs: $logDir" -ForegroundColor Green
-    if ($script:agentMode) { return }   # the remote agent drives the fans itself
+    if ($script:agentMode) { return }   # the remote agent drives the fans itself (and checks the clocks every tick)
+    if ($ml -gt 0 -or $cl -gt 0) {
+        # Check on the card itself that the locks took: KRig applies them once mining starts, a few seconds after launch.
+        Write-Host 'Checking the clocks on the card (nvidia-smi) ...' -ForegroundColor DarkGray
+        Start-Sleep -Seconds 12
+        try {
+            $pw = Get-PowerInfo
+            foreach ($x in @(@('Memory','mem',$ml,$pw.MemClock), @('Core','core',$cl,$pw.CoreClock))) {
+                $chk = Get-ClockCheck $x[2] $x[3] $true $x[1]
+                if ($chk -eq 'ok') { Write-Host ("{0} clock lock {1} MHz is in effect ({2:N0} MHz)." -f $x[0],$x[2],$x[3]) -ForegroundColor Green }
+                elseif ($chk -eq 'off') { Write-Host ("{0} clock lock {1} MHz is NOT in effect: the card runs at {2:N0} MHz. See the miner window and its log; the main menu keeps checking." -f $x[0],$x[2],$x[3]) -ForegroundColor Red }
+            }
+        } catch { Write-Host "Could not read the clocks: $($_.Exception.Message)" -ForegroundColor Yellow }
+    }
     if ($script:cfg.fan_mode -eq 'manual') {
         # Manual fan speed does not survive a reboot, so reapply it whenever we can.
         if ($script:isAdmin) {
@@ -251,7 +396,7 @@ function Start-Miner([string]$StartMode,[switch]$NonInteractive) {
 
 function Stop-Miner([switch]$NonInteractive) {
     if (Test-DryRunSkip 'stop the miner') { return }
-    $running = @(Get-Process -Name krig-miner -ErrorAction SilentlyContinue)
+    $running = @(Get-MinerProcess)
     if ($running.Count -eq 0) { Write-Host 'No miner is running.' }
     else {
         # Tells a running remote agent that this stop is on purpose, so it is not treated as a crash.
@@ -261,7 +406,7 @@ function Stop-Miner([switch]$NonInteractive) {
             if ($NonInteractive) { Remove-Item $minerStopFile -Force -ErrorAction SilentlyContinue; throw "Could not stop the miner: $($_.Exception.Message)" }
             # An elevated miner (started with clock offsets) can only be stopped with administrator rights.
             Write-Host 'The miner runs with administrator rights: approve the Windows prompt to stop it.' -ForegroundColor Yellow
-            $k = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\taskkill.exe') -ArgumentList @('/F','/IM','krig-miner.exe') `
+            $k = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\taskkill.exe') -ArgumentList @('/F','/IM',((Get-MinerProcessName) + '.exe')) `
                 -Verb RunAs -Wait -PassThru -WindowStyle Hidden
             if ($k.ExitCode -ne 0) {
                 Remove-Item $minerStopFile -Force -ErrorAction SilentlyContinue
@@ -273,11 +418,11 @@ function Stop-Miner([switch]$NonInteractive) {
 }
 
 function Start-MinerInMode([string]$StartMode) {
-    if (Get-Process -Name krig-miner -ErrorAction SilentlyContinue) {
+    if (Get-MinerProcess) {
         $answer = (Read-Host "Miner is already running. Stop it and restart in $StartMode mode? (y/N)").Trim()
         if ($answer -ne 'y') { Write-Host 'Left running unchanged.'; return }
         Stop-Miner
-        Get-Process -Name krig-miner -ErrorAction SilentlyContinue | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
+        Get-MinerProcess | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
     }
     Start-Miner $StartMode
 }
@@ -288,7 +433,7 @@ function Show-Summary {
     $energyWh = 0.0; $lastSample = $null; $lastWatts = $null
     while ($true) {
         $now = Get-Date
-        $proc = Get-Process -Name krig-miner -ErrorAction SilentlyContinue | Select-Object -First 1
+        $proc = Get-MinerProcess | Select-Object -First 1
         $api = $null; $apiErr = $null
         if ($proc) { try { $api = Invoke-RestMethod -Uri $uri -TimeoutSec 2 } catch { $apiErr = $_.Exception.Message } }
         $watts = $null; $gpuText = 'GPU telemetry unavailable'; $gpuColor = 'Gray'
@@ -378,11 +523,46 @@ function ConvertTo-InvariantDouble([string]$s) {
 
 function Get-PowerInfo {
     if (-not (Find-Smi)) { throw 'nvidia-smi not found. Install the NVIDIA driver first.' }
-    $g = Invoke-Smi 'name,power.draw,power.limit,power.default_limit,power.min_limit,power.max_limit,fan.speed,temperature.gpu' |
-        ConvertFrom-Csv -Header name,draw,limit,default,min,max,fan,temp
+    $g = Invoke-Smi 'name,power.draw,power.limit,power.default_limit,power.min_limit,power.max_limit,fan.speed,temperature.gpu,clocks.mem,clocks.gr' |
+        ConvertFrom-Csv -Header name,draw,limit,default,min,max,fan,temp,memclk,coreclk
     return [pscustomobject]@{ Name=$g.name.Trim(); Draw=(ConvertTo-InvariantDouble $g.draw); Limit=(ConvertTo-InvariantDouble $g.limit);
         Default=(ConvertTo-InvariantDouble $g.default); Min=(ConvertTo-InvariantDouble $g.min); Max=(ConvertTo-InvariantDouble $g.max);
-        Fan=(ConvertTo-InvariantDouble $g.fan); Temp=(ConvertTo-InvariantDouble $g.temp) }
+        Fan=(ConvertTo-InvariantDouble $g.fan); Temp=(ConvertTo-InvariantDouble $g.temp); MemClock=(ConvertTo-InvariantDouble $g.memclk)
+        CoreClock=(ConvertTo-InvariantDouble $g.coreclk) }
+}
+
+# Does the card really run the lock we set? nvidia-smi is the truth, not our config. Pure, so it is tested without a GPU.
+# none = no lock set; pending = applies at the next miner start (miner stopped, or no reading); ok; off = set but not in effect.
+# Memory: an RTX 4090 snaps to one of its memory clocks (405, 810, 5001, 10251, 10501), so the reading must be close to the lock.
+# Core: the lock is a ceiling (a power limit can hold the clock below it), so only a clock clearly ABOVE the lock means it is not applied.
+function Get-ClockCheck([int]$Want,$Now,[bool]$Running,[string]$Kind) {
+    if ($Want -le 0) { return 'none' }
+    if (-not $Running -or $null -eq $Now) { return 'pending' }
+    if ($Kind -eq 'mem') { if ([Math]::Abs([double]$Now - $Want) -le 60) { return 'ok' } else { return 'off' } }
+    if ([double]$Now -le $Want + 45) { return 'ok' } else { return 'off' }
+}
+
+# The core lock only reaches KRig (other miners have no placeholder for it yet), so with another miner there is no lock to check.
+function Get-EffectiveCoreLock {
+    try { if ((Get-ActiveMiner).id -ne 'krig') { return 0 } } catch { }
+    return [int]$script:cfg.core_lock
+}
+
+function Write-GpuStatusLine([bool]$Running) {
+    Write-Host '  GPU        ' -NoNewline -ForegroundColor DarkGray
+    try { $pi = Get-PowerInfo } catch { Write-Host 'no reading (nvidia-smi)' -ForegroundColor Yellow; return }
+    $tc = 'Green'; if ($pi.Temp -ge 83) { $tc = 'Red' } elseif ($pi.Temp -ge 75) { $tc = 'Yellow' }
+    Write-Host ('{0:N0} C' -f $pi.Temp) -ForegroundColor $tc -NoNewline
+    Write-Host ('  {0:N0} W  ' -f $pi.Draw) -ForegroundColor White -NoNewline
+    foreach ($x in @(@('core', (Get-EffectiveCoreLock), $pi.CoreClock), @('mem', [int]$script:cfg.mem_lock, $pi.MemClock))) {
+        Write-Host ('{0} {1:N0} MHz' -f $x[0], $x[2]) -ForegroundColor Gray -NoNewline
+        $chk = Get-ClockCheck $x[1] $x[2] $Running $x[0]
+        if ($chk -eq 'ok') { Write-Host ' ' -NoNewline; Write-Pill 'on' $false ("LOCK {0}" -f $x[1]) }
+        elseif ($chk -eq 'off') { Write-Host ' ' -NoNewline; Write-Pill 'off' $false ("LOCK {0} NOT APPLIED" -f $x[1]) }
+        elseif ($chk -eq 'pending') { Write-Host (' (lock {0} at miner start)' -f $x[1]) -ForegroundColor DarkGray -NoNewline }
+        Write-Host '   ' -NoNewline
+    }
+    Write-Host ''
 }
 
 function Initialize-Nvml {
@@ -628,8 +808,28 @@ function Read-Offset([string]$Label,[int]$Min,[int]$Max) {
     return $n
 }
 
+# Memory clock lock: 0 = off. The RTX 4090 only runs at a few memory clocks (nvidia-smi --query-supported-clocks=memory:
+# 405, 810, 5001, 10251, 10501 MHz); the driver snaps a lock to one of them, and the live memory clock shows which.
+$memLockMin = 400; $memLockMax = 15000
+function Read-MemLock {
+    $v = (Read-Host "Memory clock lock in MHz ($memLockMin..$memLockMax, for example 810 for current Pearl kernels; 0 = off)").Trim()
+    $n = 0
+    if (-not [int]::TryParse($v,[ref]$n) -or ($n -ne 0 -and ($n -lt $memLockMin -or $n -gt $memLockMax))) { throw 'Invalid value. Nothing changed.' }
+    return $n
+}
+
+$coreLockMin = 300; $coreLockMax = 3200
+function Read-CoreLock {
+    $v = (Read-Host "Core clock lock in MHz ($coreLockMin..$coreLockMax, for example 2400; 0 = off)").Trim()
+    $n = 0
+    if (-not [int]::TryParse($v,[ref]$n) -or ($n -ne 0 -and ($n -lt $coreLockMin -or $n -gt $coreLockMax))) { throw 'Invalid value. Nothing changed.' }
+    return $n
+}
+
+function Format-MemLock([int]$Mhz) { if ($Mhz -gt 0) { return "$Mhz MHz" } return 'off' }
+
 function Invoke-OffsetRestart {
-    if (-not (Get-Process -Name krig-miner -ErrorAction SilentlyContinue)) { Write-Host 'Saved. It applies the next time the miner starts.'; return }
+    if (-not (Get-MinerProcess)) { Write-Host 'Saved. It applies the next time the miner starts.'; return }
     if ((Read-Host 'Saved. The running miner still uses the old offsets. Restart it now to apply? (y/N)').Trim() -ne 'y') {
         Write-Host 'Not restarted. The new offsets apply on the next miner start.'; return
     }
@@ -639,10 +839,50 @@ function Invoke-OffsetRestart {
     Write-Host 'Check the miner log or window: the clock columns show the offset, for example "2505 (+200)".'
 }
 
+# ---- Console UI: box lines, group headers and ON/OFF pills ----
+# This file stays ASCII (Windows PowerShell 5.1 reads a file without BOM as ANSI), so box characters are made at runtime.
+# Redirected output (logs, tests) gets plain ASCII.
+$script:uiFancy = -not [Console]::IsOutputRedirected
+function Get-UiChars {
+    if ($script:uiFancy) {
+        # only characters of code page 437, so every console font (Lucida Console, Consolas, raster) has them
+        return @{ h=[string][char]0x2500; v=[string][char]0x2502; tl=[string][char]0x250C; tr=[string][char]0x2510; bl=[string][char]0x2514; br=[string][char]0x2518
+                  dot=[string][char]0x2022; arrow=[string][char]0x25BA; sep=[string][char]0x00B7 }
+    }
+    return @{ h='-'; v='|'; tl='+'; tr='+'; bl='+'; br='+'; dot='*'; arrow='>'; sep='.' }
+}
+function Get-UiWidth {
+    # rows fill the window (at least 72 columns, at most 110) so status pills never wrap
+    $w = 80
+    try { $w = [Console]::WindowWidth } catch { }
+    return [Math]::Max(72, [Math]::Min(110, $w - 4))
+}
+
 function Write-BoxLine([string]$Text,[string]$Color) {
-    Write-Host '  |' -ForegroundColor DarkCyan -NoNewline
-    Write-Host (' ' + $Text).PadRight(54).Substring(0,54) -ForegroundColor $Color -NoNewline
-    Write-Host '|' -ForegroundColor DarkCyan
+    $c = Get-UiChars; $w = Get-UiWidth
+    Write-Host ('  ' + $c.v) -ForegroundColor DarkCyan -NoNewline
+    Write-Host (' ' + $Text).PadRight($w - 2).Substring(0,$w - 2) -ForegroundColor $Color -NoNewline
+    Write-Host $c.v -ForegroundColor DarkCyan
+}
+
+# A coloured status pill. $State: on | off | unknown | fixed, or any short text (shown neutral). $Server: set by the dashboard (*).
+function Write-Pill([string]$State,[bool]$Server = $false,[string]$Text = '') {
+    $star = $(if ($Server) { '*' } else { ' ' })
+    switch ($State) {
+        'on'      { $t = $(if ($Text) { $Text } else { 'ON' }); $fg = 'White'; $bg = 'DarkGreen' }
+        'off'     { $t = $(if ($Text) { $Text } else { 'OFF' }); $fg = 'White'; $bg = 'DarkRed' }
+        'unknown' { $t = '?'; $fg = 'Black'; $bg = 'DarkGray' }
+        'fixed'   { $t = $(if ($Text) { $Text } else { 'ON' }); $fg = 'DarkGreen'; $bg = 'Black' }
+        default   { $t = $State; $fg = 'Black'; $bg = 'Gray' }
+    }
+    Write-Host $star -ForegroundColor Magenta -NoNewline
+    Write-Host (' ' + $t + ' ') -ForegroundColor $fg -BackgroundColor $bg -NoNewline
+}
+
+function Write-Rule([string]$Title = '') {
+    $c = Get-UiChars; $w = Get-UiWidth
+    if ($Title) { Write-Host ('  ' + $c.h + $c.h + ' ') -ForegroundColor DarkCyan -NoNewline; Write-Host $Title -ForegroundColor Cyan -NoNewline; Write-Host (' ' + ($c.h * [Math]::Max(2, $w - $Title.Length - 4))) -ForegroundColor DarkCyan }
+    else { Write-Host ('  ' + ($c.h * $w)) -ForegroundColor DarkCyan }
 }
 
 function Test-Admin {
@@ -650,22 +890,31 @@ function Test-Admin {
 }
 
 function Write-Banner([string]$Subtitle) {
-    $rule = '  +' + ('-' * 54) + '+'
+    $c = Get-UiChars; $w = Get-UiWidth
+    try { $Host.UI.RawUI.WindowTitle = "Pearl miner - $env:COMPUTERNAME" } catch { }
     Write-Host ''
-    Write-Host $rule -ForegroundColor DarkCyan
-    Write-BoxLine ('PEARL-POW (PRL)  *  KRig {0}' -f $version) 'Cyan'
-    # Status line: subtitle on the left, elevation badge on the right (green = admin, orange = not).
+    Write-Host ('  ' + $c.tl + ($c.h * ($w - 2)) + $c.tr) -ForegroundColor DarkCyan
+    # Title line: name on the left, the PC on the right
+    $title = 'PEARL MINER  ' + $c.sep + '  PRL on RTX 4090'
+    $pc = $env:COMPUTERNAME
+    Write-Host ('  ' + $c.v + ' ') -ForegroundColor DarkCyan -NoNewline
+    Write-Host $title -ForegroundColor Cyan -NoNewline
+    Write-Host ($pc.PadLeft($w - 4 - $title.Length)) -ForegroundColor White -NoNewline
+    Write-Host (' ' + $c.v) -ForegroundColor DarkCyan
+    # Status line: subtitle on the left, badges on the right (REMOTE = the server owns the GPU settings; elevation)
     $badge = ' NOT ELEVATED '; $bg = 'DarkYellow'; $fg = 'Black'
     if ($script:isAdmin) { $badge = ' ELEVATED '; $bg = 'DarkGreen'; $fg = 'White' }
-    $avail = 52 - $badge.Length
+    $remoteBadge = ''; if (Test-Remote) { $remoteBadge = ' REMOTE ' }
+    $avail = $w - 4 - $badge.Length
+    if ($remoteBadge) { $avail -= $remoteBadge.Length + 1 }
     $sub = $Subtitle
     if ($sub.Length -gt $avail) { $sub = $sub.Substring(0,$avail) }
-    Write-Host '  |' -ForegroundColor DarkCyan -NoNewline
-    Write-Host (' ' + $sub.PadRight($avail)) -ForegroundColor DarkGray -NoNewline
+    Write-Host ('  ' + $c.v + ' ') -ForegroundColor DarkCyan -NoNewline
+    Write-Host $sub.PadRight($avail) -ForegroundColor Gray -NoNewline
+    if ($remoteBadge) { Write-Host $remoteBadge -ForegroundColor White -BackgroundColor DarkMagenta -NoNewline; Write-Host ' ' -NoNewline }
     Write-Host $badge -ForegroundColor $fg -BackgroundColor $bg -NoNewline
-    Write-Host ' ' -NoNewline
-    Write-Host '|' -ForegroundColor DarkCyan
-    Write-Host $rule -ForegroundColor DarkCyan
+    Write-Host (' ' + $c.v) -ForegroundColor DarkCyan
+    Write-Host ('  ' + $c.bl + ($c.h * ($w - 2)) + $c.br) -ForegroundColor DarkCyan
 }
 
 function Start-Elevated {
@@ -678,23 +927,57 @@ function Start-Elevated {
 }
 
 function New-MenuItem([string]$Key,[string]$Label,[string]$Tag = '',[string]$TagColor = 'Gray') {
-    [pscustomobject]@{ Key=$Key; Label=$Label; Tag=$Tag; TagColor=$TagColor }
+    [pscustomobject]@{ Key=$Key; Label=$Label; Tag=$Tag; TagColor=$TagColor; Header=$false; Pill=$null; Server=$false; Note='' }
+}
+# A row with a coloured ON/OFF pill ($State as in Write-Pill); $Note is grey text after the label.
+function New-StatusItem([string]$Key,[string]$Label,[string]$State,[bool]$Server = $false,[string]$Note = '',[string]$PillText = '') {
+    [pscustomobject]@{ Key=$Key; Label=$Label; Tag=$PillText; TagColor='Gray'; Header=$false; Pill=$State; Server=$Server; Note=$Note }
+}
+# A group header: shown, never selected.
+function New-MenuHeader([string]$Text) {
+    [pscustomobject]@{ Key=''; Label=$Text; Tag=''; TagColor='Gray'; Header=$true; Pill=$null; Server=$false; Note='' }
 }
 
 function Write-MenuItem($Item,[bool]$Selected) {
+    $c = Get-UiChars; $w = Get-UiWidth
+    if ($Item.Header) {
+        Write-Host ''
+        Write-Host ('  ' + $Item.Label.ToUpperInvariant()) -ForegroundColor DarkCyan
+        return
+    }
     $mark = '   '
-    if ($Selected) { $mark = ' > ' }
+    if ($Selected) { $mark = ' ' + $c.arrow + ' ' }
     $text = '{0}{1}  {2}' -f $mark,$Item.Key,$Item.Label
+    $pillW = 0
+    if ($Item.Pill) { $pt = $(if ($Item.Tag) { $Item.Tag } elseif ($Item.Pill -eq 'unknown') { '?' } elseif ($Item.Pill -in @('on','fixed')) { 'ON' } elseif ($Item.Pill -eq 'off') { 'OFF' } else { $Item.Pill }); $pillW = $pt.Length + 3 }
     $tag = ''
-    if ($Item.Tag) { $tag = '[' + $Item.Tag + ']' }
-    $gap = [Math]::Max(1, 56 - $text.Length - $tag.Length)
+    if (-not $Item.Pill -and $Item.Tag) { $tag = $Item.Tag }
+    $note = $(if ($Item.Note) { '  ' + $Item.Note } else { '' })
+    $room = $w - $pillW - $tag.Length - 1
+    if (($text + $note).Length -gt $room) { $note = $note.Substring(0, [Math]::Max(0, $room - $text.Length)) }
+    $gap = [Math]::Max(1, $room - $text.Length - $note.Length)
     Write-Host '  ' -NoNewline
     if ($Selected) {
-        Write-Host (($text + (' ' * $gap) + $tag).PadRight(56)) -ForegroundColor White -BackgroundColor DarkCyan
+        Write-Host ($text + $note + (' ' * $gap)) -ForegroundColor White -BackgroundColor DarkCyan -NoNewline
+        if ($tag) { Write-Host $tag -ForegroundColor White -BackgroundColor DarkCyan -NoNewline }
     } else {
-        Write-Host ($text + (' ' * $gap)) -NoNewline -ForegroundColor Gray
-        Write-Host $tag -ForegroundColor $Item.TagColor
+        Write-Host $text -ForegroundColor Gray -NoNewline
+        Write-Host ($note + (' ' * $gap)) -ForegroundColor DarkGray -NoNewline
+        if ($tag) { Write-Host $tag -ForegroundColor $Item.TagColor -NoNewline }
     }
+    if ($Item.Pill) { Write-Pill $Item.Pill $Item.Server $Item.Tag }
+    Write-Host ''
+}
+
+# Next selectable row from $Idx in direction $Dir (+1/-1), skipping headers and wrapping around. Pure: tested without a console.
+function Get-NextMenuIndex($Items,[int]$Idx,[int]$Dir) {
+    $n = @($Items).Count
+    if ($n -eq 0) { return 0 }
+    for ($i = 1; $i -le $n; $i++) {
+        $j = (($Idx + $Dir * $i) % $n + $n) % $n
+        if (-not $Items[$j].Header) { return $j }
+    }
+    return $Idx
 }
 
 function Wait-Key {
@@ -705,30 +988,34 @@ function Wait-Key {
 # Arrow-key menu: Up/Down/Home/End + Enter, or press an item's key. Esc or Q returns '0'.
 function Select-Menu([string]$Name,[object[]]$Items) {
     if ([Console]::IsInputRedirected) { return (Read-Host 'Select').Trim() }
-    $idx = 0
-    if ($script:menuPos.ContainsKey($Name)) { $idx = [Math]::Min([int]$script:menuPos[$Name], $Items.Count - 1) }
+    # the position is remembered by key, not by index: rows that come and go do not move the cursor to another item
+    $idx = Get-NextMenuIndex $Items -1 1
+    if ($script:menuPos.ContainsKey($Name)) {
+        for ($i = 0; $i -lt $Items.Count; $i++) { if (-not $Items[$i].Header -and $Items[$i].Key -eq $script:menuPos[$Name]) { $idx = $i } }
+    }
     $top = -1
     [Console]::CursorVisible = $false
     try {
         while ($true) {
             if ($top -ge 0) { [Console]::SetCursorPosition(0,$top) }
-            for ($i = 0; $i -lt $Items.Count; $i++) { Write-MenuItem $Items[$i] ($i -eq $idx) }
+            $lines = 0
+            for ($i = 0; $i -lt $Items.Count; $i++) { Write-MenuItem $Items[$i] ($i -eq $idx); $lines += $(if ($Items[$i].Header) { 2 } else { 1 }) }
             Write-Host ''
-            Write-Host '  Up/Down + Enter, or press the number.  Esc = back' -ForegroundColor DarkGray
-            if ($top -lt 0) { $top = [Console]::CursorTop - $Items.Count - 2 }
+            Write-Host '  Up/Down + Enter, or press the key.  Esc = back' -ForegroundColor DarkGray
+            if ($top -lt 0) { $top = [Console]::CursorTop - $lines - 2 }
             $k = [Console]::ReadKey($true)
             $key = $k.Key
-            if ($key -eq [ConsoleKey]::UpArrow) { $idx = ($idx + $Items.Count - 1) % $Items.Count }
-            elseif ($key -eq [ConsoleKey]::DownArrow) { $idx = ($idx + 1) % $Items.Count }
-            elseif ($key -eq [ConsoleKey]::Home) { $idx = 0 }
-            elseif ($key -eq [ConsoleKey]::End) { $idx = $Items.Count - 1 }
+            if ($key -eq [ConsoleKey]::UpArrow) { $idx = Get-NextMenuIndex $Items $idx -1 }
+            elseif ($key -eq [ConsoleKey]::DownArrow) { $idx = Get-NextMenuIndex $Items $idx 1 }
+            elseif ($key -eq [ConsoleKey]::Home) { $idx = Get-NextMenuIndex $Items -1 1 }
+            elseif ($key -eq [ConsoleKey]::End) { $idx = Get-NextMenuIndex $Items $Items.Count -1 }
             elseif ($key -eq [ConsoleKey]::Escape) { return '0' }
-            elseif ($key -eq [ConsoleKey]::Enter) { $script:menuPos[$Name] = $idx; return $Items[$idx].Key }
+            elseif ($key -eq [ConsoleKey]::Enter) { $script:menuPos[$Name] = $Items[$idx].Key; return $Items[$idx].Key }
             else {
-                $ch = [string]$k.KeyChar
-                if ($ch -eq 'q' -or $ch -eq 'Q') { return '0' }
+                $ch = ([string]$k.KeyChar).ToUpperInvariant()
+                if ($ch -eq 'Q') { return '0' }
                 for ($i = 0; $i -lt $Items.Count; $i++) {
-                    if ($Items[$i].Key -eq $ch) { $script:menuPos[$Name] = $i; return $ch }
+                    if (-not $Items[$i].Header -and $Items[$i].Key -eq $ch) { $script:menuPos[$Name] = $ch; return $ch }
                 }
             }
         }
@@ -761,8 +1048,11 @@ function Show-GpuSettings {
     while ($true) {
         $script:cfg = Get-Config   # the remote agent may have changed it
         $agentBeat = Get-AgentHeartbeat
+        $remote = Test-Remote
         $pi = Get-PowerInfo
-        $co = [int]$script:cfg.core_offset; $mo = [int]$script:cfg.mem_offset
+        $co = [int]$script:cfg.core_offset; $mo = [int]$script:cfg.mem_offset; $ml = [int]$script:cfg.mem_lock; $cl = Get-EffectiveCoreLock
+        $minerUp = [bool](Get-MinerProcess)
+        $managed = @(); if ($remote -and $agentBeat -and $agentBeat.managed) { $managed = @($agentBeat.managed) }   # * = set by the dashboard
         Clear-Host
         Write-Banner "GPU settings - $($pi.Name)"
         Write-Host ''
@@ -774,6 +1064,18 @@ function Show-GpuSettings {
         Write-Host '  Offsets      ' -NoNewline -ForegroundColor DarkGray
         Write-Host ('core {0:+#;-#;0} MHz | memory {1:+#;-#;0} MHz' -f $co,$mo) -NoNewline -ForegroundColor Yellow
         Write-Host '   (applied at miner start)' -ForegroundColor DarkGray
+        # Locks: what is set, and what the card runs right now (nvidia-smi)
+        foreach ($x in @(@('Memory lock  ','mem',$ml,$pi.MemClock), @('Core lock    ','core',$cl,$pi.CoreClock))) {
+            Write-Host ('  ' + $x[0]) -NoNewline -ForegroundColor DarkGray
+            Write-Host (Format-MemLock $x[2]) -NoNewline -ForegroundColor Yellow
+            Write-Host ('   now {0:N0} MHz  ' -f $x[3]) -NoNewline -ForegroundColor Gray
+            switch (Get-ClockCheck $x[2] $x[3] $minerUp $x[1]) {
+                'ok'      { Write-Pill 'on' $false 'IN EFFECT'; Write-Host '' }
+                'off'     { Write-Pill 'off' $false 'NOT IN EFFECT'; Write-Host '' }
+                'pending' { Write-Host '(applied at miner start)' -ForegroundColor DarkGray }
+                default   { Write-Host '' }
+            }
+        }
         $ctl = Get-FanControllerActive
         $fanMode = 'automatic'
         if ($script:cfg.fan_mode -eq 'manual') { $fanMode = 'manual ' + [int]$script:cfg.fan_percent + '%' }
@@ -790,28 +1092,38 @@ function Show-GpuSettings {
             Write-Host '  FanControl is running while fans are manual/curve here: two programs would fight over the fan.' -ForegroundColor Red
             Write-Host '  Use option X (fans controlled by FanControl) or close FanControl.' -ForegroundColor Red
         }
-        if ($agentBeat) {
+        if ($remote) {
+            Write-Host '  REMOTE: the server sets power, offsets and fans. Change them on the dashboard, not here.' -ForegroundColor Yellow
+            if ($managed.Count) { Write-Host '  * marks the values the dashboard sets right now.' -ForegroundColor Magenta }
+        } elseif ($agentBeat) {
             Write-Host '  Remote agent is running: settings set on the server override changes made here.' -ForegroundColor DarkYellow
         }
         Write-Host ''
+        $star = { param($k,$text) if ($managed -contains $k) { '*' + $text } else { $text } }
         $items = @(
-            New-MenuItem '1' 'Set power limit' ('{0:N0} W' -f $pi.Limit) 'Yellow'
+            New-MenuHeader 'Power and clocks'
+            New-MenuItem '1' 'Set power limit' (& $star 'power_limit_w' ('{0:N0} W' -f $pi.Limit)) 'Yellow'
             New-MenuItem '2' 'Reset power limit to default' ('{0:N0} W' -f $pi.Default) 'DarkGray'
-            New-MenuItem '3' 'Core clock offset' ('{0:+#;-#;0} MHz' -f $co) 'Yellow'
-            New-MenuItem '4' 'Memory clock offset' ('{0:+#;-#;0} MHz' -f $mo) 'Yellow'
-            New-MenuItem '5' 'Clear both offsets'
+            New-MenuItem '3' 'Core clock offset' (& $star 'core_offset_mhz' ('{0:+#;-#;0} MHz' -f $co)) 'Yellow'
+            New-MenuItem '4' 'Memory clock offset' (& $star 'mem_offset_mhz' ('{0:+#;-#;0} MHz' -f $mo)) 'Yellow'
+            New-MenuItem 'L' 'Memory clock lock' (& $star 'mem_lock_mhz' (Format-MemLock $ml)) 'Yellow'
+            New-MenuItem 'K' 'Core clock lock' (Format-MemLock $cl) 'Yellow'
+            New-MenuItem '5' 'Clear offsets and both locks'
             New-MenuItem '6' 'Offset limits' ('core {0}..{1}  mem {2}..{3}' -f [int]$script:cfg.core_min,[int]$script:cfg.core_max,[int]$script:cfg.mem_min,[int]$script:cfg.mem_max) 'DarkGray'
-            New-MenuItem '7' 'Fans: automatic (driver curve)' $(if ($script:cfg.fan_mode -eq 'auto') { 'ACTIVE' } else { '' }) 'Green'
+            New-MenuHeader 'Fans'
+            New-MenuItem '7' 'Fans: automatic (driver curve)' $(if ($script:cfg.fan_mode -eq 'auto') { & $star 'fan_mode' 'ACTIVE' } else { '' }) 'Green'
             New-MenuItem '8' 'Fans: manual speed' $(if ($script:cfg.fan_mode -eq 'manual') { '{0}%' -f [int]$script:cfg.fan_percent } else { '' }) 'Yellow'
             New-MenuItem '9' 'Fans: custom temperature curve' $(if ($ctl) { 'RUNNING' } elseif ($script:cfg.fan_mode -eq 'curve') { 'stopped' } else { '' }) 'Green'
             New-MenuItem 'C' 'Edit fan curve' ([string]$script:cfg.fan_curve.Split(',').Count + ' points') 'DarkGray'
             New-MenuItem 'X' 'Fans: controlled by FanControl app' $(if ($script:cfg.fan_mode -eq 'external') { 'ACTIVE' } else { '' }) 'Green'
+            New-MenuHeader 'FanControl app'
             New-MenuItem 'I' 'FanControl app: install' $(if ($fcExe) { 'installed' } else { 'not installed' }) $(if ($fcExe) { 'Green' } else { 'DarkGray' })
             New-MenuItem 'O' 'FanControl app: open' $(if ($fcRunning) { 'running' } else { '' }) 'Green'
             New-MenuItem '0' 'Back'
         )
         $c = Select-Menu 'gpu' $items
         Write-Host ''
+        if ($remote -and $c -in @('1','2','3','4','5','6','7','8','9','C','L','X')) { Write-RemoteWarning }
         if ($c -ne '0' -and -not $script:isAdmin) { Write-Host '  Power limit and offsets ask for administrator approval; fan control needs an elevated menu (press E in the main menu).' -ForegroundColor DarkYellow }
         try {
             switch ($c) {
@@ -826,7 +1138,12 @@ function Show-GpuSettings {
                 '2' { Set-PowerLimit $pi.Default; $script:cfg.power_limit_w = 0; Save-Config }
                 '3' { $script:cfg.core_offset = Read-Offset 'Core' ([int]$script:cfg.core_min) ([int]$script:cfg.core_max); Save-Config; Invoke-OffsetRestart }
                 '4' { $script:cfg.mem_offset = Read-Offset 'Memory' ([int]$script:cfg.mem_min) ([int]$script:cfg.mem_max); Save-Config; Invoke-OffsetRestart }
-                '5' { $script:cfg.core_offset = 0; $script:cfg.mem_offset = 0; Save-Config; Invoke-OffsetRestart }
+                'L' { $script:cfg.mem_lock = Read-MemLock; Save-Config; Invoke-OffsetRestart }
+                'K' {
+                    if ($remote) { Write-Host '  The dashboard does not know about core locks yet: runs and campaigns on this rig would count a locked and an unlocked core as the same setting.' -ForegroundColor Yellow }
+                    $script:cfg.core_lock = Read-CoreLock; Save-Config; Invoke-OffsetRestart
+                }
+                '5' { $script:cfg.core_offset = 0; $script:cfg.mem_offset = 0; $script:cfg.mem_lock = 0; $script:cfg.core_lock = 0; Save-Config; Invoke-OffsetRestart }
                 '6' { Set-OffsetLimits }
                 '7' {
                     if ($agentBeat) {
@@ -890,6 +1207,115 @@ function Show-GpuSettings {
     }
 }
 
+# ---- Menu S: everything that decides whether this PC comes back and mines by itself after a restart ----
+# Each row: a live reading (registry, task, power plan; never a state file) and a switch. ON (green) is always the state a mining rig
+# wants; OFF is red; ? (grey) = could not read. * = the dashboard set it last (a local change may be overwritten).
+function Get-SystemRows([switch]$Fresh) {
+    # Readings only, never a throw (the main menu draws its status from this). Cached 20 s: tasks and powercfg are slow.
+    if (-not $Fresh -and $script:sysRowsCache -and ((Get-Date) - $script:sysRowsCache.At).TotalSeconds -lt 20) { return $script:sysRowsCache.Rows }
+    $io = New-HardeningIo
+    $user = $env:USERNAME; try { $user = Get-AutoLoginUser } catch { }
+    $plan = Get-HardeningPlan $user $env:COMPUTERNAME
+    $g = @{}
+    foreach ($k in $hardenGroups.Keys) {
+        try { $g[$k] = Get-GroupStatus $plan $k $io } catch { $g[$k] = @{ state='unknown'; done=0; total=0; unknown=1 } }
+    }
+    $agentTask = Test-AgentTask
+    $wanted = Get-MinerWanted
+    $wd = [string]$script:cfg.watchdog; if ($wd -notin @('off','restart','reboot')) { $wd = 'restart' }
+    $bsod = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' 'AutoReboot'
+    $part = { param($s) if ($s.state -eq 'off' -and $s.done -gt 0) { "$($s.done) of $($s.total) in place" } else { '' } }
+    $al = $g['autologin']
+    $alNote = & $part $al
+    if ($al.state -ne 'on' -and (Test-AutoLogin)) { $alNote = 'on, set elsewhere (netplwiz)' }
+    $rows = @(
+        New-MenuHeader 'Start after a restart'
+        New-StatusItem '1' 'Auto-login (Windows signs in by itself)' $(if ($al.state -eq 'on' -or (Test-AutoLogin)) { 'on' } else { $al.state }) $false $alNote
+        New-StatusItem '2' 'Agent starts at sign-in (logon task)' $(if ($agentTask) { 'on' } else { 'off' }) $false $(if (-not $agentTask) { 'needs server URL and rig key' } else { '' })
+        New-StatusItem '3' 'Mining starts by itself after a restart' $(if ($wanted) { 'on' } else { 'off' }) ([string]$script:cfg.miner_wanted_by -eq 'dashboard') $(if ($script:cfg.miner_wanted_by -eq 'dashboard') { 'set by the dashboard' } else { '' })
+        New-StatusItem '4' 'Watchdog restarts a stuck miner' $(if ($wd -eq 'off') { 'off' } else { 'on' }) $false $(if ($wd -eq 'reboot') { 'and reboots the PC as a last resort' } else { '' }) $(if ($wd -eq 'off') { 'OFF' } else { $wd.ToUpperInvariant() })
+        New-StatusItem '5' 'Menu window opens at Windows start' $(if (Test-Path -LiteralPath $startupLnk) { 'on' } else { 'off' }) $false 'optional: the agent does the mining'
+        New-MenuHeader 'Keep Windows out of the way'
+        New-StatusItem '6' $hardenGroups['updates'] $g['updates'].state $false (& $part $g['updates'])
+        New-StatusItem '7' $hardenGroups['restarts'] $g['restarts'].state $false (& $part $g['restarts'])
+        New-StatusItem '8' $hardenGroups['drivers'] $g['drivers'].state $false (& $part $g['drivers'])
+        New-StatusItem '9' $hardenGroups['sleep'] $g['sleep'].state $false (& $part $g['sleep'])
+        New-StatusItem 'F' $hardenGroups['faststartup'] $g['faststartup'].state $false (& $part $g['faststartup'])
+        New-StatusItem 'P' $hardenGroups['powersave'] $g['powersave'].state $false (& $part $g['powersave'])
+        New-StatusItem 'B' 'Restart after a blue screen' $(if ($null -eq $bsod) { 'unknown' } elseif ([int]$bsod -ne 0) { 'fixed' } else { 'off' }) $false 'kept on on purpose: a crashed rig heals itself'
+        New-MenuHeader 'All at once'
+        New-MenuItem 'H' 'Switch every row above ON' 'one Windows prompt' 'DarkGray'
+        New-MenuItem 'U' 'Undo: Windows defaults back (rows 1 and 6-P)' '' 'DarkGray'
+        New-MenuItem 'C' 'Full rig check (read-only report)' '' 'DarkGray'
+        New-MenuItem '0' 'Back'
+    )
+    $script:sysRowsCache = @{ At=(Get-Date); Rows=$rows }
+    return $rows
+}
+
+function Show-SystemSettings {
+    while ($true) {
+        $script:cfg = Get-Config
+        Clear-Host
+        Write-Banner 'System & auto-start'
+        Write-Host ''
+        Write-Host '  Green ON is what an unattended rig wants. ' -NoNewline -ForegroundColor DarkGray
+        Write-Pill 'on'; Write-Host ' ' -NoNewline; Write-Pill 'off'; Write-Host ' ' -NoNewline; Write-Pill 'unknown'
+        Write-Host '   * = set by the dashboard' -ForegroundColor DarkGray
+        $rows = Get-SystemRows -Fresh
+        $c = Select-Menu 'system' $rows
+        Write-Host ''
+        $row = $rows | Where-Object { -not $_.Header -and $_.Key -eq $c } | Select-Object -First 1
+        $isOn = $row -and $row.Pill -in @('on','fixed')
+        $pause = $true
+        try {
+            switch ($c) {
+                '1' {
+                    if ($isOn) { Invoke-HardenAction $true 'autologin' }
+                    else {
+                        Write-Host "Auto-login will sign in '$(Get-AutoLoginUser)' with NO password. Use it only on a dedicated mining PC whose account has no password." -ForegroundColor Yellow
+                        if ((Read-Host 'Switch auto-login ON? (y/N)').Trim() -eq 'y') { Invoke-HardenAction $false 'autologin' } else { Write-Host 'Unchanged.' }
+                    }
+                }
+                '2' { if ($isOn) { Remove-AgentSetup } else { Set-AgentSetup } }
+                '3' {
+                    if ($isOn) { Set-MinerWanted $false; Write-Host 'Mining no longer starts by itself after a restart.' -ForegroundColor Yellow }
+                    else {
+                        if (-not (Test-AgentTask) -and -not (Test-Path -LiteralPath $startupLnk)) { Set-StartupHook $true; Write-Host 'The menu now opens at Windows start (needed without the agent).' }
+                        $script:cfg.autostart = $true; Save-Config; Set-MinerWanted $true
+                        Write-Host 'Mining starts by itself after a restart.' -ForegroundColor Green
+                    }
+                }
+                '4' {
+                    $next = @{ off='restart'; restart='reboot'; reboot='off' }[[string]$script:cfg.watchdog]
+                    if (-not $next) { $next = 'reboot' }
+                    if ($next -eq 'reboot' -and -not (Test-AutoLogin)) { Write-Host 'Reboot mode needs auto-login (row 1); without it a rebooted PC waits at the sign-in screen.' -ForegroundColor Yellow }
+                    $script:cfg.watchdog = $next; Save-Config
+                    Write-Host "Watchdog: $next" -ForegroundColor Green
+                }
+                '5' {
+                    $on = -not (Test-Path -LiteralPath $startupLnk)
+                    Set-StartupHook $on
+                    if (-not $on -and -not (Test-AgentTask)) { $script:cfg.autostart = $false; Save-Config; Write-Host 'Without the agent, auto-start mining was switched off too.' -ForegroundColor Yellow }
+                    Write-Host ('Menu at Windows start: {0}' -f $(if ($on) { 'ON' } else { 'OFF' }))
+                }
+                { $_ -in @('6','7','8','9','F','P') } {
+                    $grp = @{ '6'='updates'; '7'='restarts'; '8'='drivers'; '9'='sleep'; 'F'='faststartup'; 'P'='powersave' }[$c]
+                    Invoke-HardenAction $isOn $grp
+                }
+                'B' { Write-Host 'Restart after a blue screen stays as Windows has it: a crashed rig restarts and the agent brings mining back.' -ForegroundColor DarkGray }
+                'H' { Invoke-HardenAction $false }
+                'U' { if ((Read-Host 'Put the Windows defaults back for every row this script changed? (y/N)').Trim() -eq 'y') { Invoke-HardenAction $true } }
+                'C' { Invoke-RigCheck }
+                '0' { return }
+                default { $pause = $false }
+            }
+        } catch { Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red }
+        $script:agentTaskCache = $null; $script:sysRowsCache = $null
+        if ($pause) { Wait-Key }
+    }
+}
+
 function Set-WorkerSuffix {
     $cur = [string]$script:cfg.worker_suffix
     $mode = [string]$script:cfg.mode
@@ -903,12 +1329,12 @@ function Set-WorkerSuffix {
     Save-Config
     Write-Host "Saved. Worker for $mode mode will be: $(Get-DefaultWorker $mode)" -ForegroundColor Green
     if ($Worker) { Write-Host 'Note: this run was started with -Worker, which overrides the suffix for this session only.' -ForegroundColor Yellow }
-    if (-not (Get-Process -Name krig-miner -ErrorAction SilentlyContinue)) { Write-Host 'It applies the next time the miner starts.'; return }
+    if (-not (Get-MinerProcess)) { Write-Host 'It applies the next time the miner starts.'; return }
     if ((Read-Host 'The running miner still uses the old worker name. Restart it now to apply? (y/N)').Trim() -ne 'y') {
         Write-Host 'Not restarted. The new worker name applies on the next miner start.'; return
     }
     Stop-Miner
-    Get-Process -Name krig-miner -ErrorAction SilentlyContinue | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
+    Get-MinerProcess | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
     Start-Miner
 }
 
@@ -952,7 +1378,7 @@ function Install-ToDocuments {
     Set-Content (Join-Path $dest 'Start-Pearl.cmd') -Encoding ASCII -Value "@echo off`r`n$ps %*`r`npause`r`n"
     Set-Content (Join-Path $dest 'Stop-Pearl.cmd') -Encoding ASCII -Value "@echo off`r`n$ps -Stop %*`r`npause`r`n"
     Write-Host "Copied to: $dest" -ForegroundColor Green
-    Write-Host 'Run Start-Pearl.cmd from there. If Windows startup (option 5) was enabled from another folder,'
+    Write-Host 'Run Start-Pearl.cmd from there. If "Menu window opens at Windows start" (menu S) was enabled from another folder,'
     Write-Host 'turn it off and on again from the new copy so the shortcut points at it.'
 }
 
@@ -1127,6 +1553,22 @@ function Get-AgentHeartbeat {
     return $st
 }
 
+# REMOTE = the agent is running (not a dry run) and the server accepted one of its reports in the last 3 minutes. Pure, so it can be tested.
+function Test-RemoteLink($Beat,[long]$Now) {
+    if (-not $Beat -or $Beat.dry_run -or -not $Beat.last_ok_at) { return $false }
+    return (($Now - [long]$Beat.last_ok_at) -le 180)
+}
+
+function Test-Remote { return (Test-RemoteLink (Get-AgentHeartbeat) (Get-UnixNow)) }
+
+# A warning, not an error: the change is still allowed, it just will not stick while the rig is managed by the server.
+function Write-RemoteWarning {
+    Write-Host '  Warning: this rig is REMOTE (connected to the server). Power limit, clock offsets and fans are set by the server' -ForegroundColor Yellow
+    Write-Host '  and should not be changed here. The server puts its own settings back within about a minute, and an offset' -ForegroundColor Yellow
+    Write-Host '  change restarts the miner. Change the settings on the dashboard instead.' -ForegroundColor Yellow
+    Write-Host ''
+}
+
 function Test-AgentTask {
     # Cached for 20 s: the ScheduledTasks module is slow and the menu redraws often.
     $now = Get-Date
@@ -1162,9 +1604,277 @@ try {
 '@
 $agentTaskRemove = @'
 $ErrorActionPreference = 'Stop'
-try { Unregister-ScheduledTask -TaskName {NAME} -Confirm:$false; Get-ChildItem -LiteralPath {PDIR} -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'hardening-state.json' } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue; exit 0 }   # the hardening state stays: Unharden needs it
+try { Unregister-ScheduledTask -TaskName {NAME} -Confirm:$false; Get-ChildItem -LiteralPath {PDIR} -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin @('hardening-state.json','miners.json') } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue; exit 0 }   # the hardening state stays (Unharden needs it), and so do the approved miners
 catch { Set-Content -LiteralPath {ERR} -Value $_.Exception.Message; exit 1 }
 '@
+
+# Approved miners (menu M): written by an elevated script, so only an administrator can change what the agent may run.
+$minersWrite = @'
+$ErrorActionPreference = 'Stop'
+try {
+    $pd = {PDIR}
+    New-Item -ItemType Directory -Force -Path $pd | Out-Null
+    [IO.File]::WriteAllText((Join-Path $pd 'miners.json'), {JSON}, (New-Object Text.UTF8Encoding($false)))
+    exit 0
+} catch { Set-Content -LiteralPath {ERR} -Value $_.Exception.Message; exit 1 }
+'@
+
+function Save-ApprovedMiners($Extra) {
+    $json = ConvertTo-Json -InputObject @($Extra | ForEach-Object { [ordered]@{ id=$_.id; name=$_.name; exe=$_.exe; sha256=$_.sha256; stats=$_.stats } }) -Depth 4
+    $lit = "'" + $json.Replace("'","''") + "'"
+    Invoke-AgentTaskScript ((Get-AgentTaskScript $minersWrite '').Replace('{JSON}', $lit)) 'save the approved miners'
+}
+
+# ---- Miner installs and updates from the developers' official GitHub releases (menu M: I, U, B) ----
+# Only these repositories (the developers' own, from the miner research of 22 Oct 2026) and only github.com are used. The latest
+# release is read from api.github.com; the one Windows package whose name matches is taken, and only when GitHub publishes its
+# SHA-256; the download is checked against that before anything is unpacked. Each version gets its own folder
+# (InstallDir\miners\<id>\<version>), the exe is approved under the dashboard's miner id (elevated and pinned by SHA-256, as with
+# A), and the previous version stays for a rollback. A matching checksum proves the file is the one published, not that it is safe.
+# Exe names were read from each release's zip directory on 23 Oct 2026. Alpha Miner has no GitHub release here: install it by hand.
+$minerSources = [ordered]@{
+    'onezerominer' = @{ name='OneZeroMiner';        repo='OneZeroMiner/onezerominer'; asset='^onezerominer-win64-[0-9.]+\.zip$';             exe='onezerominer.exe' }
+    'srbminer'     = @{ name='SRBMiner-MULTI';      repo='doktor83/SRBMiner-Multi';   asset='^SRBMiner-Multi-[0-9-]+-win64\.zip$';            exe='SRBMiner-MULTI.exe' }
+    'wildrig'      = @{ name='WildRig Multi';       repo='andru-kun/wildrig-multi';   asset='^wildrig-multi-windows-[0-9.]+\.zip$';           exe='wildrig.exe' }
+    'wildrig-ng'   = @{ name='WildRig NG';          repo='andru-kun/wildrig-ng';      asset='^wildrig-ng-windows-[0-9.]+[a-z]?\.zip$';        exe='wildrig-ng.exe' }
+    'peakminer'    = @{ name='PeakMiner';           repo='peakminer/peakminer';       asset='^peakminer-[0-9.]+-windows-x86_64\.zip$';        exe='peakminer.exe' }
+    'forgeminer'   = @{ name='ForgeMiner';          repo='0xHashRaptor/ForgeMiner';   asset='^ForgeMiner-[0-9.]+-windows\.zip$';              exe='forge.exe' }
+    'bzminer'      = @{ name='BzMiner';             repo='bzminer/bzminer';           asset='^bzminer_v[0-9.]+_windows\.zip$';                exe='bzminer.exe' }
+    'rgminer'      = @{ name='RGMiner';             repo='Printscan/rgminer';         asset='^rgminer-[0-9.]+-windows\.zip$';                 exe='rgminer.exe' }
+    'fl4shminer'   = @{ name='Fl4shMiner';          repo='Fl4sh9174/Fl4shMiner';      asset='^fl4shminer-v[0-9.]+-windows-amd64\.zip$';       exe='fl4shminer.exe' }
+    'pearlfortune' = @{ name='Pearl Fortune miner'; repo='pearlfortune/pearl-miner';  asset='^miner-windows-v[0-9.]+\.zip$';                  exe='miner.exe' }
+}
+$minersRoot = Join-Path $InstallDir 'miners'
+
+# The package to install from one release (the object api.github.com returns), or a throw saying why not. Pure: no network.
+function Select-MinerAsset([string]$Id,$Release) {
+    $src = $minerSources[$Id]
+    if (-not $src) { throw "no official source is known for '$Id'" }
+    $tag = [string]$Release.tag_name
+    if ($tag -notmatch '^v?([0-9][A-Za-z0-9._-]{0,39})$') { throw "unexpected release tag '$(Limit-Text $tag 40)'" }
+    $ver = $Matches[1]
+    if ($Release.prerelease -or $Release.draft) { throw "the latest $($src.name) release is a pre-release" }
+    $hits = @($Release.assets | Where-Object { [string]$_.name -match $src.asset })
+    if ($hits.Count -ne 1) { throw "the $($src.name) $tag release has $($hits.Count) Windows packages matching; expected exactly one" }
+    $a = $hits[0]
+    $url = [string]$a.browser_download_url
+    if (-not $url.StartsWith("https://github.com/$($src.repo)/releases/download/", [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'the download address is not on this repository''s releases'
+    }
+    if ([string]$a.digest -notmatch '^sha256:([0-9a-fA-F]{64})$') { throw "GitHub publishes no SHA-256 for $($a.name); install it by hand and approve it with A" }
+    $sha = $Matches[1].ToUpperInvariant()
+    $size = [int64]$a.size
+    if ($size -le 0 -or $size -gt 500MB) { throw 'unexpected package size' }
+    return [ordered]@{ id=$Id; name=$src.name; repo=$src.repo; tag=$tag; version=$ver; file=[string]$a.name; url=$url; sha256=$sha; size=$size
+                       published=([string]$Release.published_at) }
+}
+
+function Get-MinerRelease([string]$Id) {
+    $src = $minerSources[$Id]
+    if (-not $src) { throw "no official source is known for '$Id'" }
+    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$($src.repo)/releases/latest" -TimeoutSec 20 -UseBasicParsing `
+        -Headers @{ Accept='application/vnd.github+json'; 'User-Agent'='PearlMenu/1'; 'X-GitHub-Api-Version'='2022-11-28' }
+    return Select-MinerAsset $Id $rel
+}
+
+# Unpack without letting an entry escape the folder (no ..\ or absolute names); macOS metadata folders are skipped.
+function Expand-ZipSafely([string]$Zip,[string]$Dest) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $root = [IO.Path]::GetFullPath($Dest).TrimEnd('\') + '\'
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    $z = [IO.Compression.ZipFile]::OpenRead($Zip)
+    try {
+        foreach ($e in $z.Entries) {
+            $rel = $e.FullName.Replace('/', '\')
+            if ($rel -match '(^|\\)__MACOSX(\\|$)') { continue }
+            if ($rel -match '^[\\]|^[A-Za-z]:' ) { throw "unsafe path in the package: $($e.FullName)" }
+            $target = [IO.Path]::GetFullPath($root + $rel)
+            if (-not $target.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "unsafe path in the package: $($e.FullName)" }
+            if ($rel.EndsWith('\')) { New-Item -ItemType Directory -Force -Path $target | Out-Null; continue }
+            New-Item -ItemType Directory -Force -Path ([IO.Path]::GetDirectoryName($target)) | Out-Null
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $target, $true)
+        }
+    } finally { $z.Dispose() }
+}
+
+# Download, check and unpack one release. Returns the full path of the miner exe inside it.
+function Install-MinerRelease($Rel) {
+    $root = Join-Path $minersRoot $Rel.id
+    $dir = Join-Path $root $Rel.version
+    $zip = Join-Path $root ($Rel.version + '.download')
+    $ProgressPreference = 'SilentlyContinue'    # this function only: Windows PowerShell's progress bar slows a 50 MB download many times over
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    Write-Host ("Downloading {0} ({1:N1} MB) from github.com/{2} ..." -f $Rel.file, ($Rel.size / 1MB), $Rel.repo)
+    try {
+        Invoke-WebRequest -Uri $Rel.url -OutFile $zip -UseBasicParsing -TimeoutSec 900 -Headers @{ 'User-Agent'='PearlMenu/1' }
+        $got = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+        if ($got -ne $Rel.sha256) { throw 'the download does not match the SHA-256 GitHub publishes for it; nothing was unpacked' }
+        Write-Host '  SHA-256 matches the one GitHub publishes.' -ForegroundColor Green
+        if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
+        Expand-ZipSafely $zip $dir
+    } finally { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue }
+    $want = $minerSources[$Rel.id].exe
+    $exes = @(Get-ChildItem -LiteralPath $dir -Recurse -File -Filter '*.exe' -ErrorAction SilentlyContinue | Where-Object { $_.Name -ieq $want })
+    if ($exes.Count -ne 1) {
+        throw "expected one $want in the package, found $($exes.Count). If Windows Security removed it, check Protection history (miners are often flagged as unwanted software)."
+    }
+    return $exes[0].FullName
+}
+
+# Keep the approved version and the one before it; older version folders of that miner are removed (a running exe stays).
+function Remove-OldMinerVersions([string]$Id,[string[]]$Keep) {
+    $root = Join-Path $minersRoot $Id
+    if (-not (Test-Path -LiteralPath $root)) { return }
+    $keepVersions = @($Keep | ForEach-Object { Get-ManagedMinerVersion @{ id=$Id; exe=$_ } } | Where-Object { $_ })
+    foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory)) {
+        if ($keepVersions -notcontains $d.Name) { Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# The version a managed install runs: the name of its folder under InstallDir\miners\<id>\, or '' for a miner approved by hand.
+function Get-ManagedMinerVersion($Miner) {
+    if (-not $Miner -or -not $Miner.exe) { return '' }
+    $root = (Join-Path $minersRoot $Miner.id).TrimEnd('\') + '\'
+    $full = [IO.Path]::GetFullPath([string]$Miner.exe)
+    if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { return '' }
+    return ($full.Substring($root.Length) -split '\\')[0]
+}
+
+# One elevated write for several miners (one Windows prompt): $Set = @(@{ id; name; exe }).
+function Set-ApprovedMinersBatch($Set) {
+    $ids = @($Set | ForEach-Object { $_.id })
+    $extra = @(Get-ApprovedMiners | Where-Object { $_.id -ne 'krig' -and $ids -notcontains $_.id })
+    $new = @($Set | ForEach-Object { [ordered]@{ id=$_.id; name=$_.name; exe=$_.exe; sha256=(Get-FileHash -LiteralPath $_.exe -Algorithm SHA256).Hash; stats='none' } })
+    Save-ApprovedMiners (@($extra) + $new)
+}
+
+function Set-ApprovedMiner([string]$Id,[string]$Name,[string]$Exe) { Set-ApprovedMinersBatch @(@{ id=$Id; name=$Name; exe=$Exe }) }
+
+function Install-OfficialMiner([string]$Id) {
+    $rel = Get-MinerRelease $Id
+    $cur = @(Get-ApprovedMiners | Where-Object { $_.id -eq $Id })[0]
+    $have = Get-ManagedMinerVersion $cur
+    Write-Host ''
+    Write-Host ("  {0}: latest {1} (released {2}) from github.com/{3}" -f $rel.name, $rel.tag, ($rel.published -replace 'T.*',''), $rel.repo)
+    Write-Host ("  Package {0}, {1:N1} MB, SHA-256 {2}" -f $rel.file, ($rel.size / 1MB), $rel.sha256) -ForegroundColor DarkGray
+    if ($cur) { Write-Host ("  Approved now: {0}{1}" -f $cur.exe, $(if ($have) { " (version $have)" } else { ' (approved by hand)' })) -ForegroundColor DarkGray }
+    if ($have -and $have -eq $rel.version) { Write-Host '  Already the latest version.' -ForegroundColor Green; return $false }
+    if ((Read-Host "  Download, check and approve $($rel.name) $($rel.version) as '$Id'? (y/N)").Trim() -ne 'y') { Write-Host '  Cancelled.'; return $false }
+    $exe = Install-MinerRelease $rel
+    Set-ApprovedMiner $Id "$($rel.name) $($rel.version)" $exe
+    Remove-OldMinerVersions $Id @($exe, $(if ($cur) { $cur.exe }))
+    Write-Host "  Approved $($rel.name) $($rel.version) as '$Id': $exe" -ForegroundColor Green
+    $p = Get-ActiveProfile
+    if ($p -and [string]$p.miner -eq $Id -and (Get-MinerProcess)) { Write-Host '  The running miner is the old version: restart it (menu 3) to use the new one.' -ForegroundColor Yellow }
+    return $true
+}
+
+function Show-MinerUpdates {
+    Write-Host ''
+    Write-Host '  Checking the official releases on GitHub ...' -ForegroundColor DarkGray
+    $all = Get-ApprovedMiners
+    $updates = @()
+    foreach ($id in $minerSources.Keys) {
+        $cur = @($all | Where-Object { $_.id -eq $id })[0]
+        $have = Get-ManagedMinerVersion $cur
+        try {
+            $rel = Get-MinerRelease $id
+            $state = if (-not $cur) { 'not installed' } elseif (-not $have) { 'approved by hand' } elseif ($have -eq $rel.version) { 'up to date' } else { 'UPDATE' }
+            if ($state -eq 'UPDATE') { $updates += @{ rel=$rel; old=$cur.exe } }
+            $col = if ($state -eq 'UPDATE') { 'Yellow' } elseif ($state -eq 'up to date') { 'Green' } else { 'DarkGray' }
+            Write-Host ('  {0,-14} {1,-12} latest {2,-10} {3}' -f $id, $(if ($have) { $have } else { '-' }), $rel.version, $state) -ForegroundColor $col
+        } catch { Write-Host ('  {0,-14} {1,-12} {2}' -f $id, $(if ($have) { $have } else { '-' }), "check failed: $($_.Exception.Message)") -ForegroundColor Red }
+    }
+    if (-not $updates.Count) { Write-Host '  Every miner installed from its release is up to date.' -ForegroundColor Green; return }
+    if ((Read-Host "  Update $($updates.Count) miner(s) now? (y/N)").Trim() -ne 'y') { return }
+    $done = @()
+    foreach ($u in $updates) {
+        try { $done += @{ id=$u.rel.id; name="$($u.rel.name) $($u.rel.version)"; exe=(Install-MinerRelease $u.rel); old=$u.old } }
+        catch { Write-Host "  $($u.rel.id): $($_.Exception.Message)" -ForegroundColor Red }
+    }
+    if (-not $done.Count) { return }
+    Set-ApprovedMinersBatch $done       # one Windows prompt for all of them
+    foreach ($d in $done) { Remove-OldMinerVersions $d.id @($d.exe, $d.old); Write-Host "  Approved $($d.name)." -ForegroundColor Green }
+}
+
+function Undo-MinerVersion([string]$Id) {
+    $cur = @(Get-ApprovedMiners | Where-Object { $_.id -eq $Id })[0]
+    $have = Get-ManagedMinerVersion $cur
+    if (-not $have) { throw "$Id is not installed from its release here" }
+    $root = Join-Path $minersRoot $Id
+    $prev = @(Get-ChildItem -LiteralPath $root -Directory | Where-Object { $_.Name -ne $have } | Sort-Object LastWriteTime -Descending)[0]
+    if (-not $prev) { throw "no earlier version of $Id is kept" }
+    $exe = @(Get-ChildItem -LiteralPath $prev.FullName -Recurse -File -Filter '*.exe' | Where-Object { $_.Name -ieq $minerSources[$Id].exe })[0]
+    if (-not $exe) { throw "the earlier version has no $($minerSources[$Id].exe)" }
+    if ((Read-Host "  Go back from $have to $($prev.Name) for '$Id'? (y/N)").Trim() -ne 'y') { Write-Host '  Cancelled.'; return }
+    [void](Set-ApprovedMiner $Id "$($minerSources[$Id].name) $($prev.Name)" $exe.FullName)
+    Write-Host "  '$Id' now runs $($prev.Name). Restart the miner if it is running." -ForegroundColor Green
+}
+
+function Read-MinerSourceId {
+    $ids = @($minerSources.Keys)
+    for ($i = 0; $i -lt $ids.Count; $i++) { Write-Host ('  {0,2}  {1,-14} {2,-20} github.com/{3}' -f ($i + 1), $ids[$i], $minerSources[$ids[$i]].name, $minerSources[$ids[$i]].repo) }
+    $c = (Read-Host 'Number').Trim()
+    $n = ConvertTo-NullableInt $c
+    if ($null -eq $n -or $n -lt 1 -or $n -gt $ids.Count) { return $null }
+    return $ids[$n - 1]
+}
+
+function Show-ApprovedMiners {
+    while ($true) {
+        Clear-Host
+        Write-Banner 'Miners the dashboard may use in mining profiles'
+        Write-Host ''
+        $all = Get-ApprovedMiners
+        foreach ($m in $all) { Write-Host ('  {0,-18} {1,-26} stats: {2,-5} {3}' -f $m.id, $m.name, $m.stats, $m.exe) }
+        $p = Get-ActiveProfile
+        Write-Host ''
+        if ($p) { Write-Host "  Active profile: $($p.name) | $($p.account) on $($p.pool_url) | miner $($p.miner)" -ForegroundColor Cyan }
+        else { Write-Host '  Active profile: none (local config: KRig with the saved username and mode)' -ForegroundColor DarkGray }
+        Write-Host ''
+        Write-Host '  The dashboard can only pick a miner from this list. Each one is pinned by its SHA-256: if the file changes, it is refused.' -ForegroundColor DarkGray
+        Write-Host '  I  Install or update a miner from its official GitHub release    U  Check all for updates    B  Back to the previous version'
+        Write-Host '  A  Approve a miner exe by hand    R  Remove one    0  Back'
+        $c = (Read-Host 'Choice').Trim().ToUpperInvariant()
+        $extra = @($all | Where-Object { $_.id -ne 'krig' })
+        try {
+            if ($c -eq 'I') {
+                $id = Read-MinerSourceId
+                if (-not $id) { continue }
+                [void](Install-OfficialMiner $id)
+            } elseif ($c -eq 'U') {
+                Show-MinerUpdates
+            } elseif ($c -eq 'B') {
+                $id = (Read-Host 'Miner id to go back (e.g. srbminer)').Trim().ToLowerInvariant()
+                if ($id) { Undo-MinerVersion $id }
+            } elseif ($c -eq 'A') {
+                $exe = (Read-Host 'Full path to the miner .exe').Trim().Trim('"')
+                if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf) -or $exe -notmatch '\.exe$') { throw 'No such .exe file.' }
+                $exe = (Resolve-Path -LiteralPath $exe).Path
+                $id = (Read-Host 'Short id used in profiles (lower case, e.g. lolminer-188)').Trim().ToLowerInvariant()
+                if ($id -notmatch '^[a-z0-9][a-z0-9_.-]{0,31}$' -or $id -eq 'krig') { throw 'Id: 1-32 lower case letters, digits, . - _ (not krig).' }
+                if ($extra | Where-Object { $_.id -eq $id }) { throw "The id $id is already used; remove it first." }
+                $name = Limit-Text ((Read-Host 'Display name').Trim()) 64; if (-not $name) { $name = $id }
+                $st = 'none'
+                if ((Read-Host 'Does it serve the KRig HTTP API on the api port (live TH/s and shares)? (y/N)').Trim() -eq 'y') { $st = 'krig' }
+                $sha = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+                Write-Host "SHA-256: $sha"
+                if ((Read-Host "Approve $exe as '$id'? Profiles from the dashboard may then run it with their arguments. (y/N)").Trim() -ne 'y') { Write-Host 'Cancelled.'; Wait-Key; continue }
+                Save-ApprovedMiners (@($extra) + @([ordered]@{ id=$id; name=$name; exe=$exe; sha256=$sha; stats=$st }))
+                Write-Host "Approved. The dashboard sees '$id' with the next report." -ForegroundColor Green
+            } elseif ($c -eq 'R') {
+                $id = (Read-Host 'Id to remove').Trim().ToLowerInvariant()
+                if ($id -eq 'krig') { throw 'KRig is built in.' }
+                if (-not ($extra | Where-Object { $_.id -eq $id })) { throw "No approved miner $id." }
+                if ($p -and [string]$p.miner -eq $id) { Write-Host 'The active profile uses it: the agent falls back to KRig until the dashboard assigns another profile.' -ForegroundColor Yellow }
+                Save-ApprovedMiners @($extra | Where-Object { $_.id -ne $id })
+                Write-Host 'Removed.' -ForegroundColor Green
+            } elseif ($c -eq '0' -or $c -eq '') { return }
+            else { continue }
+        } catch { Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red }
+        Wait-Key
+    }
+}
 
 # Read-only: true when Windows signs this user in by itself after a reboot (the logon task needs that to start the agent unattended).
 function Test-AutoLogin {
@@ -1183,7 +1893,7 @@ function Get-AgentTaskScript([string]$Template,[string]$User) {
     $minerExe = Join-Path $InstallDir "krig-$version\krig-miner.exe"
     $hardenLine = ''
     if ($Harden -and $Template -like '*{HARDEN}*') {
-        $hardenLine = 'try { & ' + (& $lit $psExe) + ' -NoProfile -ExecutionPolicy Bypass -File (Join-Path $pd ''Start-Pearl.ps1'') -Action Harden -InstallDir ' + (& $lit $InstallDir) + ' } catch { }   # hardening trouble must not stop the task from being registered'
+        $hardenLine = 'try { & ' + (& $lit $psExe) + ' -NoProfile -ExecutionPolicy Bypass -File (Join-Path $pd ''Start-Pearl.ps1'') -Action Harden -InstallDir ' + (& $lit $InstallDir) + ' -AutoLoginUser ' + (& $lit $env:USERNAME) + ' } catch { }   # hardening (auto-login included) must not stop the task from being registered'
     }
     return $Template.Replace('{HARDEN}',$hardenLine).Replace('{EXE}',(& $lit $psExe)).Replace('{ARGS}',(& $lit $taskArgs)).Replace('{DIR}',(& $lit $protDir)).
         Replace('{PDIR}',(& $lit $protDir)).Replace('{SRC}',(& $lit $scriptPath)).Replace('{MINER}',(& $lit $minerExe)).
@@ -1261,7 +1971,7 @@ function Set-AgentSetup([switch]$Unattended) {
     if (Test-AutoLogin) { Write-Host 'Windows auto-login is ON for this user: after a reboot the agent comes back without anyone present.' -ForegroundColor Green }
     else {
         Write-Host 'Windows auto-login is OFF for this user. After a reboot this PC waits at the sign-in screen and the agent does not start until someone signs in.' -ForegroundColor Yellow
-        Write-Host 'Turn it on yourself (see docs/RUNBOOK.md, "Unattended reboot"); this script never changes sign-in settings.' -ForegroundColor Yellow
+        Write-Host 'Switch it on in menu S (System & auto-start, row 1), or set up with -Harden, which includes it.' -ForegroundColor Yellow
     }
 }
 
@@ -1352,8 +2062,10 @@ function Read-AgentGpu {
 }
 
 function Get-AgentMinerInfo {
-    $o = @{ running=$false; pid=$null; start=$null; hashrate_ths=$null; accepted=0; stale=0; rejected=0 }
-    $proc = @(Get-Process -Name krig-miner -ErrorAction SilentlyContinue | Sort-Object Id)
+    $o = @{ running=$false; pid=$null; start=$null; hashrate_ths=$null; accepted=0; stale=0; rejected=0; stats=$true }
+    # A profile miner without KRig's API: hashrate and shares are unknown (null), never 0, so nothing reads them as a stall.
+    if ((Get-ActiveMiner).stats -ne 'krig') { $o.stats = $false; $o.accepted = $null; $o.stale = $null; $o.rejected = $null }
+    $proc = @(Get-MinerProcess | Sort-Object Id)
     if ($proc.Count -eq 0) { return $o }
     $o.running = $true; $o.pid = $proc[0].Id
     try { $o.start = $proc[0].StartTime.ToUniversalTime() } catch { }
@@ -1362,6 +2074,7 @@ function Get-AgentMinerInfo {
         if ($script:ag.seenPid -ne $o.pid) { $script:ag.seenPid = $o.pid; $script:ag.seenAt = [DateTime]::UtcNow }
         $o.start = $script:ag.seenAt
     }
+    if (-not $o.stats) { return $o }
     try {
         $api = Invoke-RestMethod -Uri "http://127.0.0.1:$([int]$script:cfg.api_port)/" -TimeoutSec 1
         $hr = 0.0
@@ -1379,13 +2092,23 @@ function Get-MinerStartOffsets([int]$MinerPid) {
     # PROTOCOL rule 1 compares against the offsets the running miner was started with: its command line is the truth.
     $c = $script:ag.offsetCache
     if ($c -and $c.pid -eq $MinerPid) { return $c }
-    $r = @{ pid=$MinerPid; core=[int]$script:cfg.core_offset; mem=[int]$script:cfg.mem_offset; source='config' }
+    $r = @{ pid=$MinerPid; core=[int]$script:cfg.core_offset; mem=[int]$script:cfg.mem_offset; mlock=[int]$script:cfg.mem_lock; source='config' }
+    $mi = Get-ActiveMiner
+    if ($mi.id -ne 'krig') {
+        # Another miner's flags cannot be parsed back: it got exactly the saved values its template takes, and 0 for the rest.
+        $sup = Get-ProfileSupport (Get-ActiveProfile) $mi
+        if (-not $sup.core) { $r.core = 0 }; if (-not $sup.mem) { $r.mem = 0 }; if (-not $sup.lock) { $r.mlock = 0 }
+        $r.source = 'profile'
+        $script:ag.offsetCache = $r
+        return $r
+    }
     try {
         $cl = [string](Get-CimInstance Win32_Process -Filter "ProcessId=$MinerPid" -ErrorAction Stop).CommandLine
         if ($cl) {
-            $r.core = 0; $r.mem = 0; $r.source = 'command line'
+            $r.core = 0; $r.mem = 0; $r.mlock = 0; $r.source = 'command line'
             if ($cl -match '--gpu-coffset[= ]\+?(-?\d+)') { $r.core = [int]$Matches[1] }
             if ($cl -match '--gpu-moffset[= ]\+?(-?\d+)') { $r.mem = [int]$Matches[1] }
+            if ($cl -match '--gpu-mclock[= ](\d+)') { $r.mlock = [int]$Matches[1] }
         }
     } catch { }
     $script:ag.offsetCache = $r
@@ -1394,13 +2117,14 @@ function Get-MinerStartOffsets([int]$MinerPid) {
 
 # ---- Settings: actual, target (clamped), compare, apply ----
 function Copy-Settings($S) {
-    return @{ power_limit_w=$S.power_limit_w; core_offset_mhz=$S.core_offset_mhz; mem_offset_mhz=$S.mem_offset_mhz; fan_mode=$S.fan_mode; fan_percent=$S.fan_percent }
+    return @{ power_limit_w=$S.power_limit_w; core_offset_mhz=$S.core_offset_mhz; mem_offset_mhz=$S.mem_offset_mhz; mem_lock_mhz=[int]$S.mem_lock_mhz
+              fan_mode=$S.fan_mode; fan_percent=$S.fan_percent }
 }
 
 function Format-AgentSettings($S) {
     $fan = [string]$S.fan_mode
     if ($S.fan_mode -eq 'manual') { $fan += " $($S.fan_percent)%" }
-    return "power $($S.power_limit_w) W, core $($S.core_offset_mhz), mem $($S.mem_offset_mhz), fans $fan"
+    return "power $($S.power_limit_w) W, core $($S.core_offset_mhz), mem $($S.mem_offset_mhz), mem lock $(Format-MemLock ([int]$S.mem_lock_mhz)), fans $fan"
 }
 
 function Get-AgentActual([switch]$Real) {
@@ -1409,11 +2133,11 @@ function Get-AgentActual([switch]$Real) {
     if ($script:isDryRun -and -not $Real) { return (Copy-Settings $script:ag.sim) }
     $pl = $null
     if ($script:ag.smi) { $pl = ConvertTo-NullableInt $script:ag.smi.power_limit_w }
-    $co = [int]$script:cfg.core_offset; $mo = [int]$script:cfg.mem_offset
-    if ($script:ag.miner.running) { $o = Get-MinerStartOffsets $script:ag.miner.pid; $co = $o.core; $mo = $o.mem }
+    $co = [int]$script:cfg.core_offset; $mo = [int]$script:cfg.mem_offset; $ml = [int]$script:cfg.mem_lock
+    if ($script:ag.miner.running) { $o = Get-MinerStartOffsets $script:ag.miner.pid; $co = $o.core; $mo = $o.mem; $ml = [int]$o.mlock }
     $fm = [string]$script:cfg.fan_mode
     if ($fm -notin @('auto','manual','curve','external')) { $fm = 'auto' }
-    return @{ power_limit_w=$pl; core_offset_mhz=$co; mem_offset_mhz=$mo; fan_mode=$fm; fan_percent=[int]$script:cfg.fan_percent }
+    return @{ power_limit_w=$pl; core_offset_mhz=$co; mem_offset_mhz=$mo; mem_lock_mhz=$ml; fan_mode=$fm; fan_percent=[int]$script:cfg.fan_percent }
 }
 
 function Get-AgentLimits {
@@ -1433,9 +2157,23 @@ function Limit-Setting($Value,[int]$Min,[int]$Max,[string]$Label,$Notes) {
 
 # Desired state clamped to this rig's limits (PROTOCOL rule 2: the server is not trusted to be in range).
 # A null field keeps the current value. Returns @{ target = full settings; notes = what was clamped or ignored }.
-function Get-AgentTarget($Desired,$Current,$Limits) {
+function Get-AgentTarget($Desired,$Current,$Limits,$Support = $null) {
     $t = Copy-Settings $Current
     $notes = New-Object System.Collections.ArrayList
+    # $Support (Get-ProfileSupport): a profile miner that cannot take a setting keeps it as it is, so it never causes a restart loop.
+    if ($Support) {
+        $skip = @()
+        if (-not $Support.core -and $null -ne $Desired.core_offset_mhz -and [int]$Desired.core_offset_mhz -ne [int]$Current.core_offset_mhz) { $skip += 'core offset' }
+        if (-not $Support.mem -and $null -ne $Desired.mem_offset_mhz -and [int]$Desired.mem_offset_mhz -ne [int]$Current.mem_offset_mhz) { $skip += 'memory offset' }
+        if (-not $Support.lock -and $null -ne $Desired.mem_lock_mhz -and [int]$Desired.mem_lock_mhz -ne [int]$Current.mem_lock_mhz) { $skip += 'memory lock' }
+        if ($skip.Count) { [void]$notes.Add(($skip -join ', ') + ' not supported by the profile''s miner (no placeholder); left as is') }
+        $d = @{}
+        foreach ($k in @('power_limit_w','core_offset_mhz','mem_offset_mhz','mem_lock_mhz','fan_mode','fan_percent')) { $d[$k] = $Desired.$k }
+        if (-not $Support.core) { $d.core_offset_mhz = $null }
+        if (-not $Support.mem) { $d.mem_offset_mhz = $null }
+        if (-not $Support.lock) { $d.mem_lock_mhz = $null }
+        $Desired = $d
+    }
     if ($null -ne $Desired.power_limit_w) {
         if ($null -eq $Limits.power_min -or $null -eq $Limits.power_max) { [void]$notes.Add('power limit skipped: GPU limits unknown') }
         else { $v = Limit-Setting $Desired.power_limit_w $Limits.power_min $Limits.power_max 'power limit' $notes; if ($null -ne $v) { $t.power_limit_w = $v } }
@@ -1445,6 +2183,13 @@ function Get-AgentTarget($Desired,$Current,$Limits) {
     }
     if ($null -ne $Desired.mem_offset_mhz) {
         $v = Limit-Setting $Desired.mem_offset_mhz $Limits.mem_min $Limits.mem_max 'memory offset' $notes; if ($null -ne $v) { $t.mem_offset_mhz = $v }
+    }
+    # Memory lock: absent (an older server) keeps the current one; 0 or less means unlocked, anything else is clamped.
+    if ($null -ne $Desired.mem_lock_mhz) {
+        $ml = ConvertTo-NullableInt $Desired.mem_lock_mhz
+        if ($null -eq $ml) { [void]$notes.Add('memory lock ignored: not a number') }
+        elseif ($ml -le 0) { $t.mem_lock_mhz = 0 }
+        else { $t.mem_lock_mhz = Limit-Setting $ml $memLockMin $memLockMax 'memory lock' $notes }
     }
     $fm = $Desired.fan_mode
     if ($Current.fan_mode -eq 'external') { }   # fans belong to the FanControl app: server fan settings are ignored
@@ -1468,6 +2213,7 @@ function Compare-AgentSettings($Want,$Have) {
     if ($null -ne $Want.power_limit_w -and ($null -eq $Have.power_limit_w -or [Math]::Abs([double]$Want.power_limit_w - [double]$Have.power_limit_w) -ge 1)) { $d += 'power_limit_w' }
     if ([int]$Want.core_offset_mhz -ne [int]$Have.core_offset_mhz) { $d += 'core_offset_mhz' }
     if ([int]$Want.mem_offset_mhz -ne [int]$Have.mem_offset_mhz) { $d += 'mem_offset_mhz' }
+    if ([int]$Want.mem_lock_mhz -ne [int]$Have.mem_lock_mhz) { $d += 'mem_lock_mhz' }
     if ([string]$Want.fan_mode -ne [string]$Have.fan_mode) { $d += 'fan_mode' }
     elseif ($Want.fan_mode -eq 'manual' -and [int]$Want.fan_percent -ne [int]$Have.fan_percent) { $d += 'fan_percent' }
     return $d
@@ -1486,7 +2232,7 @@ function Sync-AgentConfig {
     # Pick up menu edits (fan mode, curve, limits, autostart, cutoff) without restarting the agent.
     try {
         $stamp = (Get-Item -LiteralPath $configFile -ErrorAction Stop).LastWriteTimeUtc
-        if ($stamp -ne $script:ag.cfgStamp) { $script:cfg = Get-Config; $script:ag.cfgStamp = $stamp; Write-AgentLog 'config.json changed; reloaded.' }
+        if ($stamp -ne $script:ag.cfgStamp) { $script:cfg = Get-Config; $script:ag.cfgStamp = $stamp; $script:ag.readyAt = $null; Write-AgentLog 'config.json changed; reloaded.' }
     } catch { }
 }
 
@@ -1497,7 +2243,7 @@ function Invoke-AgentApply($T,[string]$Why) {
     $diff = @(Compare-AgentSettings $T $have)
     if ($diff.Count -eq 0) { return $false }
     Write-AgentLog "Applying ${Why}: $(Format-AgentSettings $T) (was: $(Format-AgentSettings $have))" 'Yellow'
-    $offsets = ($diff -contains 'core_offset_mhz') -or ($diff -contains 'mem_offset_mhz')
+    $offsets = ($diff -contains 'core_offset_mhz') -or ($diff -contains 'mem_offset_mhz') -or ($diff -contains 'mem_lock_mhz')
     if ($script:isDryRun) {
         foreach ($k in $diff) { Write-AgentLog "DRY-RUN would change ${k}: $($have[$k]) -> $($T[$k])" 'Magenta' }
         if ($offsets -and $script:ag.miner.running) { Write-AgentLog 'DRY-RUN would restart the miner to apply the clock offsets.' 'Magenta' }
@@ -1514,7 +2260,7 @@ function Invoke-AgentApply($T,[string]$Why) {
         $changes.fan_mode = [string]$T.fan_mode
         if ($T.fan_mode -eq 'manual') { $changes.fan_percent = [int]$T.fan_percent }
     }
-    if ($offsets) { $changes.core_offset = [int]$T.core_offset_mhz; $changes.mem_offset = [int]$T.mem_offset_mhz }
+    if ($offsets) { $changes.core_offset = [int]$T.core_offset_mhz; $changes.mem_offset = [int]$T.mem_offset_mhz; $changes.mem_lock = [int]$T.mem_lock_mhz }
     Update-AgentConfig $changes
     if ($changes.Contains('fan_mode')) { Update-AgentFans -Force }
     if ($offsets -and $script:ag.miner.running) { Restart-AgentMiner 'new clock offsets' }
@@ -1593,9 +2339,9 @@ function Start-AgentMiner {
 
 function Stop-AgentMiner {
     if (Test-DryRunSkip 'stop the miner') { return }
-    foreach ($p in @(Get-Process -Name krig-miner -ErrorAction SilentlyContinue)) { [void]$script:ag.selfStops.Add($p.Id) }   # our stop, not a crash
+    foreach ($p in @(Get-MinerProcess)) { [void]$script:ag.selfStops.Add($p.Id) }   # our stop, not a crash
     Stop-Miner -NonInteractive
-    Get-Process -Name krig-miner -ErrorAction SilentlyContinue | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
+    Get-MinerProcess | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
     $script:ag.miner = Get-AgentMinerInfo
     if ($script:ag.miner.running) { throw 'The miner did not exit within 15 s.' }
 }
@@ -1636,11 +2382,14 @@ function Add-AgentResult($Res) {
 function Read-AgentMemory {
     # revision/run_id: the desired state in effect (survives agent restarts, so a known run is not re-trialed);
     # blocked: revisions that failed here (never applied again); done: executed command ids with their results.
-    $m = @{ revision=0; run_id=$null; blocked=(New-Object System.Collections.ArrayList); done=(New-Object System.Collections.ArrayList) }
+    # profile_refused: mining profile fingerprints that were refused or rolled back here (never tried again).
+    $m = @{ revision=0; run_id=$null; blocked=(New-Object System.Collections.ArrayList); done=(New-Object System.Collections.ArrayList)
+            profile_refused=(New-Object System.Collections.ArrayList) }
     $j = Read-JsonFile (Get-AgentFile 'agent-memory.json')
     if ($j) {
         $m.revision = [int]$j.revision; $m.run_id = ConvertTo-NullableInt $j.run_id
         foreach ($r in @($j.blocked)) { if ($null -ne $r) { [void]$m.blocked.Add([int]$r) } }
+        foreach ($h in @($j.profile_refused)) { if ([string]$h -match '^[a-z0-9]{1,16}$') { [void]$m.profile_refused.Add([string]$h) } }
         foreach ($c in @($j.done)) { if ($c -and $c.id) { [void]$m.done.Add([ordered]@{ id=[string]$c.id; status=[string]$c.status; detail=[string]$c.detail }) } }
     }
     return $m
@@ -1649,7 +2398,8 @@ function Read-AgentMemory {
 function Save-AgentMemory {
     param([switch]$Required)
     $m = $script:ag.mem
-    try { Write-JsonFile (Get-AgentFile 'agent-memory.json') ([ordered]@{ revision=$m.revision; run_id=$m.run_id; blocked=@($m.blocked); done=@($m.done) }) }
+    try { Write-JsonFile (Get-AgentFile 'agent-memory.json') ([ordered]@{ revision=$m.revision; run_id=$m.run_id; blocked=@($m.blocked); done=@($m.done)
+                                                                         profile_refused=@($m.profile_refused) }) }
     catch { if ($Required) { throw }; Add-AgentError "Cannot save agent-memory.json: $($_.Exception.Message)" }   # -Required: a command must not run when its 'done' record could not be saved
 }
 
@@ -1665,7 +2415,7 @@ function Add-AgentBlocked($Rev) {
 function New-AgentSnapshot {
     $s = Get-AgentActual
     return [ordered]@{ revision=$script:ag.mem.revision; run_id=$script:ag.mem.run_id; power_limit_w=$s.power_limit_w
-        core_offset_mhz=$s.core_offset_mhz; mem_offset_mhz=$s.mem_offset_mhz; fan_mode=$s.fan_mode; fan_percent=$s.fan_percent; saved_at=(Get-UnixNow) }
+        core_offset_mhz=$s.core_offset_mhz; mem_offset_mhz=$s.mem_offset_mhz; mem_lock_mhz=$s.mem_lock_mhz; fan_mode=$s.fan_mode; fan_percent=$s.fan_percent; saved_at=(Get-UnixNow) }
 }
 
 function Reset-TrialWatch { $script:ag.watch = @{ hrBadSince=$null; hot=0; okS=0.0 } }
@@ -1702,7 +2452,8 @@ function Update-TrialWatch($W,$Obs,[double]$Dt) {
     } else { $W.hot = 0 }
     if ($Obs.crashed) { return @{ verdict='crash'; detail='miner exited during the trial' } }
     if (-not $Obs.running) { $W.hrBadSince = $null; return @{ verdict='none'; detail='' } }   # stopped on purpose: the trial waits
-    $bad = ($null -eq $Obs.hashrate -or $Obs.hashrate -le 0)
+    # A miner without a stats API (no_stats) never reports a hashrate: that is unknown, not a collapse.
+    $bad = (-not $Obs.no_stats) -and ($null -eq $Obs.hashrate -or $Obs.hashrate -le 0)
     if ($bad -and ($null -eq $Obs.up_s -or $Obs.up_s -ge $agentMinerWarmupS)) {
         if ($null -eq $W.hrBadSince) { $W.hrBadSince = $Obs.now }
         elseif ($Obs.now - $W.hrBadSince -ge $agentHashrateDeadS) { return @{ verdict='crash'; detail="hashrate 0 for $($Obs.now - $W.hrBadSince) s" } }
@@ -1769,7 +2520,8 @@ function Invoke-AgentWatch($Prev,[double]$Dt) {
     if ($script:ag.smiFails -eq 0 -and $script:ag.smi) { $temp = $script:ag.smi.temp_c }
     $up = $null
     if ($m.running -and $m.start) { $up = ([DateTime]::UtcNow - $m.start).TotalSeconds }
-    $obs = @{ now=(Get-UnixNow); running=$m.running; crashed=$crashed; hashrate=$m.hashrate_ths; temp=$temp; cutoff=(Get-AgentCutoff); up_s=$up }
+    $obs = @{ now=(Get-UnixNow); running=$m.running; crashed=$crashed; hashrate=$m.hashrate_ths; temp=$temp; cutoff=(Get-AgentCutoff); up_s=$up
+              no_stats=($m.stats -eq $false) }
     $v = Update-TrialWatch $script:ag.watch $obs $Dt
     if ($v.verdict -eq 'temp_abort' -or $v.verdict -eq 'crash') { Invoke-AgentRevert $v.verdict $v.detail }
     elseif ($v.verdict -eq 'promote') { Complete-AgentTrial }
@@ -1798,7 +2550,7 @@ function Invoke-AgentReconcile($Resp) {
     }
     if ([DateTime]::UtcNow -lt $script:ag.applyHoldUntil) { return }
     $isNew = ($rev -ne $script:ag.mem.revision)
-    $tg = Get-AgentTarget $d (Get-AgentActual) (Get-AgentLimits)
+    $tg = Get-AgentTarget $d (Get-AgentActual) (Get-AgentLimits) (Get-AgentProfileSupport)
     if ($isNew) {
         Write-AgentLog "New desired state: revision $rev, run $runId." 'Cyan'
         foreach ($n in $tg.notes) { Add-AgentError "Revision ${rev}: $n" }
@@ -1831,6 +2583,139 @@ function Invoke-AgentReconcile($Resp) {
     } elseif ($changed) { Write-AgentLog "Re-applied revision $rev (the rig had drifted from it)." }
 }
 
+# ---- Mining profile from the dashboard (PROTOCOL.md, "Mining profiles") ----
+$agentProfileStartS = 20       # a new profile's miner without stats must still run this long after the switch, else roll back
+$agentProfileHashrateS = 180   # a KRig-API miner must show a hashrate this soon (KRig needs ~30 s), else roll back
+
+function Get-AgentProfileSupport {
+    $p = Get-ActiveProfile
+    if (-not $p) { return $null }
+    return (Get-ProfileSupport $p (Get-ActiveMiner))
+}
+
+function Get-AgentProfileState {
+    # What the report says: the refusal of the profile the server wants, or what runs now.
+    $r = $script:ag.profileRefusal
+    if ($r) { return [ordered]@{ id=[int]$r.id; hash=[string]$r.hash; state='refused'; detail=(Limit-Text ([string]$r.detail) 200) } }
+    $p = Get-ActiveProfile
+    if ($p) { return [ordered]@{ id=[int]$p.id; hash=[string]$p.hash; state='applied'; detail='' } }
+    return [ordered]@{ id=0; hash='local'; state='local'; detail='' }
+}
+
+# -Persist (the miner really failed on this PC): never tried again. Without it (miner not approved, exe changed) it is checked again
+# when the approved list changes or after 5 minutes, so approving the miner in menu M is enough.
+function Set-AgentProfileRefused([string]$Hash,$Id,[string]$Why,[switch]$Persist) {
+    $script:ag.profileRefusal = @{ hash=$Hash; id=(ConvertTo-NullableInt $Id); detail=$Why; at=[DateTime]::UtcNow; stamp=(Get-MinersStamp); persist=[bool]$Persist }
+    Add-AgentError "Mining profile refused: $Why"
+    if ($Persist -and $script:ag.mem.profile_refused -notcontains $Hash) {
+        [void]$script:ag.mem.profile_refused.Add($Hash)
+        while ($script:ag.mem.profile_refused.Count -gt 50) { $script:ag.mem.profile_refused.RemoveAt(0) }
+        Save-AgentMemory
+    }
+}
+
+function Get-MinersStamp { try { return (Get-Item -LiteralPath $minersFile -ErrorAction Stop).LastWriteTimeUtc.Ticks } catch { return 0 } }
+
+function Save-AgentProfile($P) {
+    $f = Get-AgentFile 'profile.json'
+    if ($null -eq $P) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+    else { Write-JsonFile $f $P }
+    $script:ag.offsetCache = $null
+}
+
+function Invoke-AgentProfile($Resp) {
+    if (-not $Resp -or $Resp.PSObject.Properties.Name -notcontains 'profile' -or $null -eq $Resp.profile) { return }   # absent: leave alone
+    $want = $Resp.profile
+    $hash = [string]$want.hash
+    if ($hash -notmatch '^[a-z0-9]{1,16}$') { Add-AgentError 'Mining profile without a valid hash ignored.'; return }
+    $cur = Get-ActiveProfile
+    $curHash = 'local'; if ($cur) { $curHash = [string]$cur.hash }
+    if ($script:ag.profileProbation) { return }   # the last switch is still being checked
+    if ($hash -eq $curHash) { $script:ag.profileRefusal = $null; return }
+    if ($script:ag.mem.profile_refused -contains $hash) {
+        if (-not $script:ag.profileRefusal -or $script:ag.profileRefusal.hash -ne $hash) {
+            $script:ag.profileRefusal = @{ hash=$hash; id=(ConvertTo-NullableInt $want.id); detail='its miner failed here before; not tried again (edit the profile to retry)'; persist=$true }
+        }
+        return
+    }
+    $rf = $script:ag.profileRefusal
+    if ($rf -and $rf.hash -eq $hash -and -not $rf.persist -and $rf.stamp -eq (Get-MinersStamp) -and ([DateTime]::UtcNow - $rf.at).TotalSeconds -lt 300) { return }
+    if ($script:ag.trial) {   # never change the miner in the middle of a tuning trial
+        if ($script:ag.profileWaitLogged -ne $hash) { Write-AgentLog 'New mining profile waits until the trial is confirmed or ends.'; $script:ag.profileWaitLogged = $hash }
+        return
+    }
+    if ([DateTime]::UtcNow -lt $script:ag.applyHoldUntil) { return }
+    $new = $null
+    if ((ConvertTo-NullableInt $want.id) -ne 0) {
+        try { $mi = Resolve-ProfileMiner $want } catch { Set-AgentProfileRefused $hash $want.id $_.Exception.Message; return }
+        $new = [ordered]@{ id=[int]$want.id; name=(Limit-Text ([string]$want.name) 40); hash=$hash; miner=[string]$want.miner
+            pool_url=[string]$want.pool_url; account=[string]$want.account; mode=[string]$want.mode; worker=[string]$want.worker; args=[string]$want.args }
+    }
+    $label = 'local config'; if ($new) { $label = "$($new.name) ($($new.account) on $($new.pool_url), miner $($new.miner))" }
+    if (Test-DryRunSkip "switch the mining profile to $label") { return }
+    Write-AgentLog "Switching the mining profile to $label" 'Cyan'
+    $wasRunning = [bool]$script:ag.miner.running
+    if ($wasRunning) { Stop-AgentMiner }    # stops the old miner while profile.json still names it
+    Save-AgentProfile $new
+    if (-not ($wasRunning -or (Get-MinerWanted))) {
+        $script:ag.profileRefusal = $null
+        Add-AgentEvent 'profile' $script:ag.mem.run_id "now $label (miner not running; used at its next start)"
+        return
+    }
+    # Probation, checked every tick (Invoke-ProfileProbation): a KRig-API miner must show a hashrate within 3 minutes (a wrong pool or
+    # account never does), another miner must keep running for $agentProfileStartS. Either failure goes back to the previous setup.
+    $pb = @{ hash=$hash; id=(ConvertTo-NullableInt $want.id); label=$label; prev=$cur; since=[DateTime]::UtcNow; stats=[string](Get-ActiveMiner).stats }
+    $pb.until = $pb.since.AddSeconds($(if ($pb.stats -eq 'krig') { $agentProfileHashrateS } else { $agentProfileStartS }))
+    $script:ag.profileProbation = $pb
+    try { Start-AgentMiner } catch { Undo-AgentProfile "the miner did not start: $($_.Exception.Message)"; return }
+    Write-AgentLog "Mining profile switched; checking it until $($pb.until.ToLocalTime().ToString('HH:mm:ss'))."
+}
+
+# The card must really run the locks the miner was started with (nvidia-smi is the truth). Checked once the miner has run 2 minutes;
+# a lock that is not in effect is reported once per miner process as an error (dashboard rig page), never acted on.
+function Invoke-ClockCheck {
+    $m = $script:ag.miner; $g = $script:ag.smi
+    if (-not $m.running -or -not $m.start -or -not $g -or $script:ag.smiFails -gt 0) { return }
+    if (([DateTime]::UtcNow - $m.start).TotalSeconds -lt 120 -or $script:ag.clockCheckedPid -eq $m.pid) { return }
+    $script:ag.clockCheckedPid = $m.pid
+    $act = Get-AgentActual
+    foreach ($x in @(@('Memory','mem',[int]$act.mem_lock_mhz,$g.mem_mhz), @('Core','core',(Get-EffectiveCoreLock),$g.core_mhz))) {
+        if ((Get-ClockCheck $x[2] $x[3] $true $x[1]) -eq 'off') {
+            Add-AgentError ("{0} clock lock {1} MHz is not in effect: the card runs at {2} MHz (see the miner log)." -f $x[0],$x[2],$x[3])
+        }
+    }
+}
+
+function Invoke-ProfileProbation {
+    $pb = $script:ag.profileProbation
+    if (-not $pb) { return }
+    $m = $script:ag.miner
+    if (-not (Get-MinerWanted)) { $script:ag.profileProbation = $null; return }   # stopped on purpose: no verdict
+    if (-not $m.running) { Undo-AgentProfile 'the miner exited; see the newest miner log'; return }
+    $ok = ($pb.stats -eq 'krig' -and $null -ne $m.hashrate_ths -and [double]$m.hashrate_ths -gt 0)
+    if (-not $ok -and [DateTime]::UtcNow -lt $pb.until) { return }
+    if (-not $ok -and $pb.stats -eq 'krig') {
+        Undo-AgentProfile ("no hashrate within {0} min: check the pool address and the account" -f [int]($agentProfileHashrateS / 60)); return
+    }
+    $script:ag.profileProbation = $null
+    $script:ag.profileRefusal = $null
+    Add-AgentEvent 'profile' $script:ag.mem.run_id "now $($pb.label)"
+}
+
+# Back to the setup before the switch (the previous profile or the local config); that profile is never tried again here.
+function Undo-AgentProfile([string]$Why) {
+    $pb = $script:ag.profileProbation
+    $script:ag.profileProbation = $null
+    if (-not $pb) { return }
+    Write-AgentLog "Mining profile failed ($Why); going back." 'Red'
+    try { if ((Get-AgentMinerInfo).running) { Stop-AgentMiner } } catch { Add-AgentError "Stopping the failed profile's miner: $($_.Exception.Message)" }
+    Save-AgentProfile $pb.prev
+    Set-AgentProfileRefused $pb.hash $pb.id "failed: $Why" -Persist
+    $back = 'local config'; if ($pb.prev) { $back = [string]$pb.prev.name }
+    try { Start-AgentMiner } catch { Add-AgentError "Could not restart the miner after the profile rollback: $($_.Exception.Message)" }
+    Add-AgentEvent 'profile' $script:ag.mem.run_id (Limit-Text "rolled back to $back`: $Why" 200)
+}
+
 # Rule 3: deduplicate by id (persisted), ignore expired, report a result for each. Ids are recorded before running,
 # so a command runs at most once even if the agent dies halfway.
 function Invoke-AgentCommands($Resp) {
@@ -1850,20 +2735,31 @@ function Invoke-AgentCommands($Resp) {
         $action = [string]$c.action
         try {
             if ($null -ne $c.expires_at -and [long]$c.expires_at -le $serverNow) { $res.status = 'skipped'; $res.detail = 'expired' }
-            elseif ($action -notin @('start_miner','stop_miner','restart_miner','update_script')) { $res.status = 'skipped'; $res.detail = 'unknown action' }
+            elseif ($action -notin @('start_miner','stop_miner','restart_miner','update_script','reboot_test')) { $res.status = 'skipped'; $res.detail = 'unknown action' }
             elseif ($script:isDryRun) { [void](Test-DryRunSkip "run command $action ($id)"); $res.status = 'skipped'; $res.detail = "dry run: would $action" }
-            elseif ($action -eq 'update_script') {
+            elseif ($action -eq 'reboot_test') {
+                # Restart Windows to prove the rig comes back by itself; the dashboard times it from the next reports.
+                # Refused when it could not come back (no auto-login: stuck at the sign-in screen) or would cost a trial.
+                if ($script:ag.trial) { $res.status = 'skipped'; $res.detail = 'a tuning trial is running; try again after it is confirmed' }
+                elseif (-not (Test-AutoLogin)) { $res.status = 'skipped'; $res.detail = 'Windows auto-login is off: the PC would wait at the sign-in screen (switch it on in the rig menu S, row 1)' }
+                elseif (-not (Get-MinerWanted)) { $res.status = 'skipped'; $res.detail = 'mining is not wanted on this rig (it was stopped on purpose): start the miner first' }
+                else {
+                    $script:ag.rebootAt = [DateTime]::UtcNow.AddSeconds(20)   # time to deliver this result first
+                    $script:ag.rebootWhy = 'Pearl reboot test from the dashboard'
+                    $res.status = 'done'; $res.detail = 'restarting Windows in about 20 s'
+                }
+            } elseif ($action -eq 'update_script') {
                 $res.detail = Limit-Text (Invoke-AgentScriptUpdate ([string]$c.param)) 200; $res.status = 'done'
             } elseif ($action -eq 'start_miner') {
-                Set-MinerWanted $true
+                Set-MinerWanted $true 'dashboard'
                 if ($script:ag.miner.running) { $res.detail = 'already running' } else { Start-AgentMiner; $res.detail = '' }
                 $res.status = 'done'
             } elseif ($action -eq 'stop_miner') {
-                Set-MinerWanted $false
+                Set-MinerWanted $false 'dashboard'
                 if (-not $script:ag.miner.running) { $res.detail = 'not running' } else { Stop-AgentMiner; $res.detail = '' }
                 $res.status = 'done'
             } else {
-                Set-MinerWanted $true
+                Set-MinerWanted $true 'dashboard'
                 Restart-AgentMiner 'server command'
                 Add-AgentEvent 'miner_restart' $script:ag.mem.run_id 'restart_miner command'
                 $res.status = 'done'; $res.detail = ''
@@ -1988,10 +2884,12 @@ function Get-WatchdogAction($S,$O) {
 
 function Get-MinerWanted { return ([bool]$script:cfg.miner_wanted -or [bool]$script:cfg.autostart) }
 
-function Set-MinerWanted([bool]$Wanted) {
+function Set-MinerWanted([bool]$Wanted,[string]$By = 'local') {
     # The agent keeps a wanted miner running. A deliberate stop (dashboard or menu) clears it so the watchdog and a reboot leave it stopped.
+    # $By: 'dashboard' for a dashboard command, so the menu marks the value as set by the server (*ON / *OFF).
     $script:cfg.miner_wanted = $Wanted
     if (-not $Wanted) { $script:cfg.autostart = $false }
+    $script:cfg.miner_wanted_by = $(if ($By -eq 'dashboard') { 'dashboard' } else { '' })
     Save-Config
 }
 
@@ -2017,7 +2915,8 @@ function Invoke-AgentKeepAlive {
     $now = Get-UnixNow
     $m = $a.miner
     # How long has a running miner shown no hashrate? How long has nvidia-smi been failing?
-    if ($m.running -and ($null -eq $m.hashrate_ths -or [double]$m.hashrate_ths -le 0)) { if (-not $a.wd.zeroSince) { $a.wd.zeroSince = $now } } else { $a.wd.zeroSince = $null }
+    # (a miner without stats is only checked for running: its hashrate is unknown, not zero)
+    if ($m.running -and $m.stats -ne $false -and ($null -eq $m.hashrate_ths -or [double]$m.hashrate_ths -le 0)) { if (-not $a.wd.zeroSince) { $a.wd.zeroSince = $now } } else { $a.wd.zeroSince = $null }
     if ($a.smiFails -gt 0) { if (-not $a.wd.smiBadSince) { $a.wd.smiBadSince = $now } } else { $a.wd.smiBadSince = $null }
     $up = $null; if ($m.running -and $m.start) { $up = ([DateTime]::UtcNow - $m.start).TotalSeconds }
     $boot = $null; try { $boot = [PearlSys]::GetTickCount64() / 1000.0 } catch { }
@@ -2026,7 +2925,7 @@ function Invoke-AgentKeepAlive {
     $smi = 0; if ($a.wd.smiBadSince) { $smi = $now - $a.wd.smiBadSince }
     $mk = Read-JsonFile $minerStopFile
     $recentStop = [bool]($mk -and ($now - [long]$mk.at) -lt 60)   # Stop-Miner leaves this marker: a menu or command stop is not a crash
-    $busy = [bool]($a.restartAt -or $a.rebootAt -or $recentStop)
+    $busy = [bool]($a.restartAt -or $a.rebootAt -or $recentStop -or $a.profileProbation)   # a profile on probation has its own rollback
     $o = @{ now=$now; mode=$mode; wanted=(Get-MinerWanted); running=[bool]$m.running; hashrate=$m.hashrate_ths; up_s=$up; zero_s=$zero; smi_fail_s=$smi
             boot_s=$boot; trial=[bool]$a.trial; busy=$busy; auto_login=(Test-AutoLogin) }
     $d = Get-WatchdogAction $a.wd $o
@@ -2098,7 +2997,20 @@ function New-ReadinessObject($Raw) {
         miner_wanted = $Raw.miner_wanted; watchdog = $Raw.watchdog
         edition = $(if ($Raw.edition) { Limit-Text ([string]$Raw.edition) 64 } else { $null })
         driver = $(if ($Raw.driver) { Limit-Text ([string]$Raw.driver) 64 } else { $null })
+        # the rows of menu S (group states: 'on' = true, 'off' = false, unknown = null)
+        restarts_blocked = (ConvertFrom-GroupState $Raw.restarts); power_saving_off = (ConvertFrom-GroupState $Raw.powersave)
+        agent_task = $Raw.agent_task; startup_menu = $Raw.startup_menu; autostart = $Raw.autostart
+        miner_wanted_by = $(if ($Raw.miner_wanted_by -eq 'dashboard') { 'dashboard' } else { 'local' })
+        bsod_restart = $(if ($null -eq $Raw.bsod_restart) { $null } else { [bool]([int]$Raw.bsod_restart -ne 0) })
+        checked_at = $Raw.checked_at
     }
+}
+
+function ConvertFrom-GroupState($G) {
+    if ($null -eq $G) { return $null }
+    if ($G.state -eq 'on') { return $true }
+    if ($G.state -eq 'off') { return $false }
+    return $null
 }
 
 $hardeningStateFile = Join-Path $env:ProgramFiles 'PearlAgent\hardening-state.json'
@@ -2106,7 +3018,11 @@ $hardeningStateFile = Join-Path $env:ProgramFiles 'PearlAgent\hardening-state.js
 function Get-AgentReadiness {
     # Cached for 10 minutes: powercfg is slow and these settings change rarely.
     $a = $script:ag
-    if ($a -and $a.readyAt -and ([DateTime]::UtcNow - $a.readyAt).TotalSeconds -lt 600) { return $a.ready }
+    # ... but a row switched in menu S (winset.stamp) is reported right away
+    $stamp = $null; try { $stamp = (Get-Item -LiteralPath (Join-Path $InstallDir 'winset.stamp') -ErrorAction Stop).LastWriteTimeUtc } catch { }
+    if ($a -and $a.readyAt -and ([DateTime]::UtcNow - $a.readyAt).TotalSeconds -lt 600 -and -not ($stamp -and $stamp -gt $a.readyAt)) { return $a.ready }
+    $io = New-HardeningIo
+    $plan = Get-HardeningPlan
     $wu = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
     $raw = @{
         auto_login = (Test-AutoLogin)
@@ -2119,6 +3035,11 @@ function Get-AgentReadiness {
         miner_wanted = (Get-MinerWanted); watchdog = $(if ([string]$script:cfg.watchdog -in @('off','restart','reboot')) { [string]$script:cfg.watchdog } else { 'restart' })
         edition = (Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'EditionID')
         driver = $(if ($a -and $a.smi -and $a.smi.driver) { [string]$a.smi.driver } else { $a.driverText })
+        restarts = (Get-GroupStatus $plan 'restarts' $io); powersave = (Get-GroupStatus $plan 'powersave' $io)
+        agent_task = (Test-AgentTask); startup_menu = [bool](Test-Path -LiteralPath $startupLnk); autostart = [bool]$script:cfg.autostart
+        miner_wanted_by = [string]$script:cfg.miner_wanted_by
+        bsod_restart = (Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' 'AutoReboot')
+        checked_at = (Get-UnixNow)
     }
     $r = New-ReadinessObject $raw
     if ($a) { $a.ready = $r; $a.readyAt = [DateTime]::UtcNow }
@@ -2128,27 +3049,70 @@ function Get-AgentReadiness {
 # ---- Hardening plan: what makes a PC fit for unattended mining, and how to undo it ----
 # Policy values (not service kills): Windows Update then neither installs nor restarts by itself, and cannot swap the GPU driver.
 # Each step records the value it replaced in hardening-state.json (administrator-only folder) so Unharden puts it back exactly.
-function Get-HardeningPlan {
+# Every step belongs to one group: one row of the System & auto-start menu (S), switched on and off on its own.
+# $User/$Domain: the Windows account auto-login signs in (captured by the non-elevated menu and passed to the elevated child).
+$hardenGroups = [ordered]@{
+    autologin   = 'Auto-login (Windows signs in by itself)'
+    updates     = 'Windows Update blocked'
+    restarts    = 'No restarts by Windows Update'
+    drivers     = 'GPU driver updates blocked'
+    sleep       = 'Never sleep or hibernate'
+    faststartup = 'Fast startup off (real restarts)'
+    powersave   = 'USB and PCIe power saving off'
+}
+
+function Get-HardeningPlan([string]$User = $env:USERNAME,[string]$Domain = $env:COMPUTERNAME) {
     $wu = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
     $pwr = '238c9fa8-0aad-41ed-83f4-97be242c8f20'   # Sleep subgroup
+    $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
     @(
-        @{ id='wu-no-auto-update'; kind='reg'; path="$wu\AU"; name='NoAutoUpdate'; value=1; desc='Windows Update: no automatic updates' },
-        @{ id='wu-au-options'; kind='reg'; path="$wu\AU"; name='AUOptions'; value=1; desc='Windows Update: never check automatically' },
-        @{ id='wu-no-auto-reboot'; kind='reg'; path="$wu\AU"; name='NoAutoRebootWithLoggedOnUsers'; value=1; desc='Windows Update: no restart while someone is signed in' },
-        @{ id='wu-no-drivers'; kind='reg'; path=$wu; name='ExcludeWUDriversInQualityUpdate'; value=1; desc='Windows Update: never replace the GPU driver' },
-        @{ id='do-no-peering'; kind='reg'; path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'; name='DODownloadMode'; value=0; desc='Delivery Optimization: no peer uploads' },
-        @{ id='store-no-auto'; kind='reg'; path='HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore'; name='AutoDownload'; value=2; desc='Microsoft Store: no automatic app updates' },
-        @{ id='maintenance-off'; kind='reg'; path='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance'; name='MaintenanceDisabled'; value=1; desc='Automatic maintenance (wakes and restarts the PC) off' },
-        @{ id='fast-startup-off'; kind='reg'; path='HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'; name='HiberbootEnabled'; value=0; desc='Fast startup off (a real restart every time)' },
-        @{ id='sleep-never'; kind='power'; sub=$pwr; setting='29f6c1db-86da-48c5-9fdb-f2b67b1f44da'; value=0; desc='Never sleep (on mains power)' },
-        @{ id='hibernate-never'; kind='power'; sub=$pwr; setting='9d7815a6-7ee4-497e-8888-515a05f02364'; value=0; desc='Never hibernate (on mains power)' },
-        @{ id='usb-suspend-off'; kind='power'; sub='2a737441-1930-4402-8d77-b2bebba308a3'; setting='48e6b7a6-50f5-4782-a5d4-53bb8f07e226'; value=0; desc='USB selective suspend off' },
-        @{ id='pcie-aspm-off'; kind='power'; sub='501a4d13-42af-4429-9fd1-a8218c268e20'; setting='ee12f906-d277-404b-b6da-e5fa1a576df5'; value=0; desc='PCIe link power management off (GPU stays at full link state)' },
-        @{ id='task-uo-reboot'; kind='task'; path='\Microsoft\Windows\UpdateOrchestrator\'; name='Reboot'; desc='Update Orchestrator: scheduled reboot task off' },
-        @{ id='task-uo-scan'; kind='task'; path='\Microsoft\Windows\UpdateOrchestrator\'; name='Schedule Scan'; desc='Update Orchestrator: scheduled scan off' },
-        @{ id='task-uo-wake'; kind='task'; path='\Microsoft\Windows\UpdateOrchestrator\'; name='Schedule Wake To Work'; desc='Update Orchestrator: wake-up task off' },
-        @{ id='task-wu-scan'; kind='task'; path='\Microsoft\Windows\WindowsUpdate\'; name='Scheduled Start'; desc='Windows Update: scheduled start task off' }
+        # Auto-login for an account WITHOUT a password (dedicated mining PCs). Winlogon reads these as strings (REG_SZ), not numbers.
+        @{ id='autologin-on'; group='autologin'; kind='regsz'; path=$wl; name='AutoAdminLogon'; value='1'; desc='Auto-login: on' },
+        @{ id='autologin-user'; group='autologin'; kind='regsz'; path=$wl; name='DefaultUserName'; value=$User; desc="Auto-login: user $User" },
+        @{ id='autologin-domain'; group='autologin'; kind='regsz'; path=$wl; name='DefaultDomainName'; value=$Domain; desc="Auto-login: local account on $Domain" },
+        @{ id='autologin-password'; group='autologin'; kind='regsz'; secret=$true; path=$wl; name='DefaultPassword'; value=''; desc='Auto-login: empty password (the account has none)' },
+        @{ id='autologin-count'; group='autologin'; kind='regabsent'; path=$wl; name='AutoLogonCount'; desc='Auto-login: no countdown that would switch it off' },
+        @{ id='autologin-hello'; group='autologin'; kind='reg'; path='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\PasswordLess\Device'; name='DevicePasswordLessBuildVersion'; value=0; desc='Windows Hello-only sign-in off (it blocks auto-login)' },
+        @{ id='wu-no-auto-update'; group='updates'; kind='reg'; path="$wu\AU"; name='NoAutoUpdate'; value=1; desc='Windows Update: no automatic updates' },
+        @{ id='wu-au-options'; group='updates'; kind='reg'; path="$wu\AU"; name='AUOptions'; value=1; desc='Windows Update: never check automatically' },
+        @{ id='wu-no-auto-reboot'; group='restarts'; kind='reg'; path="$wu\AU"; name='NoAutoRebootWithLoggedOnUsers'; value=1; desc='Windows Update: no restart while someone is signed in' },
+        @{ id='wu-no-drivers'; group='drivers'; kind='reg'; path=$wu; name='ExcludeWUDriversInQualityUpdate'; value=1; desc='Windows Update: never replace the GPU driver' },
+        @{ id='do-no-peering'; group='updates'; kind='reg'; path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'; name='DODownloadMode'; value=0; desc='Delivery Optimization: no peer uploads' },
+        @{ id='store-no-auto'; group='updates'; kind='reg'; path='HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore'; name='AutoDownload'; value=2; desc='Microsoft Store: no automatic app updates' },
+        @{ id='maintenance-off'; group='restarts'; kind='reg'; path='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance'; name='MaintenanceDisabled'; value=1; desc='Automatic maintenance (wakes and restarts the PC) off' },
+        @{ id='fast-startup-off'; group='faststartup'; kind='reg'; path='HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'; name='HiberbootEnabled'; value=0; desc='Fast startup off (a real restart every time)' },
+        @{ id='sleep-never'; group='sleep'; kind='power'; sub=$pwr; setting='29f6c1db-86da-48c5-9fdb-f2b67b1f44da'; value=0; desc='Never sleep (on mains power)' },
+        @{ id='hibernate-never'; group='sleep'; kind='power'; sub=$pwr; setting='9d7815a6-7ee4-497e-8888-515a05f02364'; value=0; desc='Never hibernate (on mains power)' },
+        @{ id='usb-suspend-off'; group='powersave'; kind='power'; sub='2a737441-1930-4402-8d77-b2bebba308a3'; setting='48e6b7a6-50f5-4782-a5d4-53bb8f07e226'; value=0; desc='USB selective suspend off' },
+        @{ id='pcie-aspm-off'; group='powersave'; kind='power'; sub='501a4d13-42af-4429-9fd1-a8218c268e20'; setting='ee12f906-d277-404b-b6da-e5fa1a576df5'; value=0; desc='PCIe link power management off (GPU stays at full link state)' },
+        @{ id='task-uo-reboot'; group='restarts'; kind='task'; path='\Microsoft\Windows\UpdateOrchestrator\'; name='Reboot'; desc='Update Orchestrator: scheduled reboot task off' },
+        @{ id='task-uo-scan'; group='updates'; kind='task'; path='\Microsoft\Windows\UpdateOrchestrator\'; name='Schedule Scan'; desc='Update Orchestrator: scheduled scan off' },
+        @{ id='task-uo-wake'; group='restarts'; kind='task'; path='\Microsoft\Windows\UpdateOrchestrator\'; name='Schedule Wake To Work'; desc='Update Orchestrator: wake-up task off' },
+        @{ id='task-wu-scan'; group='updates'; kind='task'; path='\Microsoft\Windows\WindowsUpdate\'; name='Scheduled Start'; desc='Windows Update: scheduled start task off' }
     )
+}
+
+# Live state of one group (never the state file): on = every step in place; off = at least one is not (partial counts as off);
+# unknown = a value could not be read (shown as ?, never as off). Pure apart from $Io, so it is tested with fakes.
+function Get-GroupStatus($Plan,[string]$Group,$Io) {
+    $steps = @($Plan | Where-Object { $_.group -eq $Group })
+    $ok = 0; $unknown = 0
+    foreach ($s in $steps) {
+        $v = $null; $good = $false
+        try {
+            switch ($s.kind) {
+                'reg'       { $v = & $Io.RegGet $s.path $s.name; $good = ($null -ne $v -and [string]$v -eq [string]$s.value) }
+                'regsz'     { $v = & $Io.RegGet $s.path $s.name; $good = ($null -ne $v -and [string]$v -eq [string]$s.value) }
+                'regabsent' { $v = & $Io.RegGet $s.path $s.name; $good = ($null -eq $v) }
+                'power'     { $v = & $Io.PowerGet $s.sub $s.setting; if ($null -eq $v) { $unknown++; continue }; $good = ([long]$v -eq [long]$s.value) }
+                'task'      { $v = & $Io.TaskGet $s.path $s.name; if ($null -eq $v) { $unknown++; continue }; $good = ($v -eq 'absent' -or $v -eq 'Disabled') }   # absent: nothing to run
+            }
+        } catch { $unknown++; continue }
+        if ($good) { $ok++ }
+    }
+    $state = 'off'
+    if ($steps.Count -gt 0 -and $ok -eq $steps.Count) { $state = 'on' } elseif ($unknown -gt 0 -and $ok + $unknown -eq $steps.Count) { $state = 'unknown' }
+    return @{ state=$state; done=$ok; total=$steps.Count; unknown=$unknown }
 }
 
 function New-HardeningIo {
@@ -2156,11 +3120,14 @@ function New-HardeningIo {
     return @{
         RegGet = { param($p,$n) Get-RegValue $p $n }
         RegSet = { param($p,$n,$v) if (-not (Test-Path -LiteralPath $p)) { New-Item -Path $p -Force | Out-Null }; New-ItemProperty -LiteralPath $p -Name $n -Value ([int]$v) -PropertyType DWord -Force | Out-Null }
+        RegSetSz = { param($p,$n,$v) if (-not (Test-Path -LiteralPath $p)) { New-Item -Path $p -Force | Out-Null }; New-ItemProperty -LiteralPath $p -Name $n -Value ([string]$v) -PropertyType String -Force | Out-Null }
         RegRemove = { param($p,$n) Remove-ItemProperty -LiteralPath $p -Name $n -ErrorAction SilentlyContinue }
         PowerGet = { param($s,$g) Get-PowerAcSeconds $s $g }
         PowerSet = { param($s,$g,$v) & powercfg.exe /setacvalueindex SCHEME_CURRENT $s $g ([string][int]$v) | Out-Null; if ($LASTEXITCODE -ne 0) { throw "powercfg exited with $LASTEXITCODE" } }
         PowerApply = { & powercfg.exe /setactive SCHEME_CURRENT | Out-Null }
-        TaskGet = { param($p,$n) try { (Get-ScheduledTask -TaskPath $p -TaskName $n -ErrorAction Stop).State.ToString() } catch { $null } }
+        # 'absent' = no such task (nothing to switch off); $null = could not read it (unknown, never "off")
+        TaskGet = { param($p,$n) try { (Get-ScheduledTask -TaskPath $p -TaskName $n -ErrorAction Stop).State.ToString() } catch {
+            if ($_.CategoryInfo.Category -eq 'ObjectNotFound' -or $_.Exception.Message -match 'No MSFT_ScheduledTask objects') { 'absent' } else { $null } } }
         TaskSet = { param($p,$n,$on) if ($on) { Enable-ScheduledTask -TaskPath $p -TaskName $n -ErrorAction Stop | Out-Null } else { Disable-ScheduledTask -TaskPath $p -TaskName $n -ErrorAction Stop | Out-Null } }
     }
 }
@@ -2178,28 +3145,43 @@ function Invoke-Hardening($Plan,$State,$Io,[switch]$Revert,[switch]$WhatIfOnly) 
                 if (-not $rec) { $r.detail = 'not applied by this script'; $res += $r; continue }
                 if ($WhatIfOnly) { $r.status = 'would-restore'; $res += $r; continue }
                 switch ($s.kind) {
-                    'reg'   { if ($rec.had) { & $Io.RegSet $s.path $s.name $rec.old } else { & $Io.RegRemove $s.path $s.name } }
-                    'power' { if ($null -ne $rec.old) { & $Io.PowerSet $s.sub $s.setting $rec.old; $powerTouched = $true } }
-                    'task'  { if ($rec.old -and $rec.old -ne 'Disabled') { & $Io.TaskSet $s.path $s.name $true } }
+                    'reg'       { if ($rec.had) { & $Io.RegSet $s.path $s.name $rec.old } else { & $Io.RegRemove $s.path $s.name } }
+                    'regsz'     { if ($rec.had) { & $Io.RegSetSz $s.path $s.name $rec.old } else { & $Io.RegRemove $s.path $s.name } }
+                    'regabsent' { if ($rec.had) { & $Io.RegSet $s.path $s.name $rec.old } }   # put the removed DWORD (AutoLogonCount) back
+                    'power'     { if ($null -ne $rec.old) { & $Io.PowerSet $s.sub $s.setting $rec.old; $powerTouched = $true } }
+                    'task'      { if ($rec.old -and $rec.old -ne 'Disabled') { & $Io.TaskSet $s.path $s.name $true } }
                 }
                 $State.steps.Remove($s.id)
                 $r.status = 'restored'
             } else {
                 $old = $null; $had = $false
                 switch ($s.kind) {
-                    'reg'   { $old = & $Io.RegGet $s.path $s.name; $had = ($null -ne $old); if ($had -and [int]$old -eq [int]$s.value) { $r.status = 'already'; break } }
-                    'power' { $old = & $Io.PowerGet $s.sub $s.setting; if ($null -ne $old -and [long]$old -eq [long]$s.value) { $r.status = 'already'; break } }
-                    'task'  { $old = & $Io.TaskGet $s.path $s.name; if ($null -eq $old) { $r.status = 'absent'; break }; if ($old -eq 'Disabled') { $r.status = 'already'; break } }
+                    'reg'       { $old = & $Io.RegGet $s.path $s.name; $had = ($null -ne $old); if ($had -and [string]$old -eq [string]$s.value) { $r.status = 'already'; break } }
+                    'regsz'     { $old = & $Io.RegGet $s.path $s.name; $had = ($null -ne $old); if ($had -and [string]$old -eq [string]$s.value) { $r.status = 'already'; break } }
+                    'regabsent' { $old = & $Io.RegGet $s.path $s.name; $had = ($null -ne $old); if (-not $had) { $r.status = 'already'; break } }
+                    'power'     { $old = & $Io.PowerGet $s.sub $s.setting; if ($null -ne $old -and [long]$old -eq [long]$s.value) { $r.status = 'already'; break } }
+                    'task'      {
+                        $old = & $Io.TaskGet $s.path $s.name
+                        if ($old -eq 'absent') { $r.status = 'absent'; break }
+                        if ($null -eq $old) { throw 'cannot read the task (access denied?)' }
+                        if ($old -eq 'Disabled') { $r.status = 'already'; break } }
                 }
                 if ($r.status -in @('already','absent')) { $res += $r; continue }
-                if ($WhatIfOnly) { $r.status = 'would-apply'; $r.detail = "was: $(if ($null -eq $old) { 'not set' } else { $old })"; $res += $r; continue }
+                if ($s.secret -and $null -ne $old -and [string]$old -ne '') {
+                    # a stored password (an account that has one): never overwrite it, log it or keep a copy of it
+                    $r.status = 'failed'; $r.detail = 'a password is stored for auto-login; this script only sets up accounts without one'; $res += $r; continue
+                }
+                $was = $(if ($null -eq $old) { 'not set' } elseif ($s.secret) { 'empty' } else { $old })
+                if ($WhatIfOnly) { $r.status = 'would-apply'; $r.detail = "was: $was"; $res += $r; continue }
                 if (-not $State.steps.Contains($s.id)) { $State.steps[$s.id] = @{ had=$had; old=$old } }   # keep the FIRST original across repeated runs
                 switch ($s.kind) {
-                    'reg'   { & $Io.RegSet $s.path $s.name $s.value }
-                    'power' { & $Io.PowerSet $s.sub $s.setting $s.value; $powerTouched = $true }
-                    'task'  { & $Io.TaskSet $s.path $s.name $false }
+                    'reg'       { & $Io.RegSet $s.path $s.name $s.value }
+                    'regsz'     { & $Io.RegSetSz $s.path $s.name $s.value }
+                    'regabsent' { & $Io.RegRemove $s.path $s.name }
+                    'power'     { & $Io.PowerSet $s.sub $s.setting $s.value; $powerTouched = $true }
+                    'task'      { & $Io.TaskSet $s.path $s.name $false }
                 }
-                $r.status = 'applied'; $r.detail = "was: $(if ($null -eq $old) { 'not set' } else { $old })"
+                $r.status = 'applied'; $r.detail = "was: $was"
             }
         } catch { $r.status = 'failed'; $r.detail = $_.Exception.Message }
         $res += $r
@@ -2223,22 +3205,47 @@ function Save-HardeningState($State) {
     $State | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $hardeningStateFile -Encoding UTF8
 }
 
-function Invoke-HardenAction([bool]$Undo) {
-    $plan = Get-HardeningPlan
+function Get-AutoLoginUser {
+    # The account auto-login signs in: -AutoLoginUser when given (the elevated child gets it from the menu), else this user.
+    $u = ([string]$AutoLoginUser).Trim()
+    if (-not $u) { $u = $env:USERNAME }
+    # letters of any language (Lukasz with an L-stroke is fine), digits, space . _ -; no quotes or path characters
+    if ($u -notmatch '^[\p{L}\p{N} ._\-]{1,64}$') { throw "Auto-login user '$u' has unexpected characters. Nothing changed." }
+    return $u
+}
+
+# $Group: one row of menu S, or empty for every row (-Action Harden / Unharden).
+function Invoke-HardenAction([bool]$Undo,[string]$Group = '') {
+    if ($Group -and -not $hardenGroups.Contains($Group)) { throw "Unknown setting '$Group'. Nothing changed." }
+    $user = Get-AutoLoginUser
+    $plan = Get-HardeningPlan $user $env:COMPUTERNAME
+    if ($Group) { $plan = @($plan | Where-Object { $_.group -eq $Group }) }
     $dry = [bool]$script:isDryRun
     if (-not $dry -and -not $script:isAdmin) {
         if (-not $scriptPath) { throw 'Run this from a saved .ps1 file.' }
-        Write-Host 'Hardening changes system settings: approve the Windows prompt.' -ForegroundColor Yellow
-        $verb = $(if ($Undo) { 'Unharden' } else { 'Harden' })
-        $p = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Verb RunAs -Wait -PassThru -ArgumentList @(
-            '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptPath + '"'),'-Action',$verb,'-InstallDir',('"' + $InstallDir + '"'))
-        if ($p.ExitCode -ne 0) { throw "$verb did not finish (exit code $($p.ExitCode)); see $(Join-Path $InstallDir 'hardening.log')." }
+        Write-Host 'This changes Windows settings: approve the Windows prompt.' -ForegroundColor Yellow
+        $a = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptPath + '"'),'-InstallDir',('"' + $InstallDir + '"'),'-AutoLoginUser',('"' + $user + '"'))
+        if ($Group) { $a += @('-Action','WinSet','-Setting',$Group,'-Value',$(if ($Undo) { 'off' } else { 'on' })) }
+        else { $a += @('-Action',$(if ($Undo) { 'Unharden' } else { 'Harden' })) }
+        $log = Join-Path $InstallDir 'hardening.log'
+        $before = 0; try { $before = @(Get-Content -LiteralPath $log -ErrorAction Stop).Count } catch { }
+        $p = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Verb RunAs -Wait -PassThru -ArgumentList $a
+        # the elevated window closes at once: show here what it did (its log lines from this run)
+        try {
+            foreach ($l in @(Get-Content -LiteralPath $log -ErrorAction Stop | Select-Object -Skip $before)) {
+                $col = 'Gray'; if ($l -match '\sfailed\s') { $col = 'Red' } elseif ($l -match '\s(applied|restored)\s') { $col = 'Green' }
+                Write-Host ('  ' + ($l -replace '^\S+\s+','')) -ForegroundColor $col
+            }
+        } catch { }
+        if ($p.ExitCode -ne 0) { throw "The change did not finish (exit code $($p.ExitCode)); see $log." }
         return
     }
     $state = Read-HardeningState
     $res = Invoke-Hardening $plan $state (New-HardeningIo) -Revert:$Undo -WhatIfOnly:$dry
+    try { Set-Content -LiteralPath (Join-Path $InstallDir 'winset.stamp') -Value (Get-UnixNow) } catch { }   # the agent re-reads readiness
     $log = Join-Path $InstallDir 'hardening.log'
     $title = $(if ($Undo) { 'Undo hardening' } else { 'Harden this PC for unattended mining' })
+    if ($Group) { $title = "$($hardenGroups[$Group]): $(if ($Undo) { 'OFF (Windows default back)' } else { 'ON' })" }
     if ($dry) { $title += ' (DRY RUN: nothing is changed)' }
     Write-Host $title -ForegroundColor Cyan
     foreach ($r in $res) {
@@ -2250,8 +3257,13 @@ function Invoke-HardenAction([bool]$Undo) {
     if (-not $dry) { if ($state.steps.Count -gt 0) { Save-HardeningState $state } elseif (Test-Path -LiteralPath $hardeningStateFile) { Remove-Item -LiteralPath $hardeningStateFile -Force } }
     $failed = @($res | Where-Object { $_.status -eq 'failed' })
     if ($failed.Count) { Write-Host ("{0} step(s) failed: some settings may need a different approach on this Windows edition." -f $failed.Count) -ForegroundColor Yellow }
-    elseif (-not $dry -and -not $Undo) { Write-Host 'Done. Windows Update will no longer install or restart this PC by itself. Undo with: -Action Unharden' -ForegroundColor Green }
-    if (-not $dry -and -not $Undo) { Write-Host 'Note: automatic restart after a blue screen stays ON on purpose (it is how a crashed PC heals itself).' -ForegroundColor DarkGray }
+    elseif (-not $dry -and -not $Undo -and -not $Group) { Write-Host 'Done. Windows Update will no longer install or restart this PC by itself. Undo with: -Action Unharden' -ForegroundColor Green }
+    if (-not $dry -and -not $Undo -and -not $Group) { Write-Host 'Note: automatic restart after a blue screen stays ON on purpose (it is how a crashed PC heals itself).' -ForegroundColor DarkGray }
+    if (-not $dry -and -not $Undo -and ($Group -eq 'autologin' -or -not $Group)) {
+        Write-Host "Auto-login signs in '$user' without a password. It cannot be checked here that the account really has none:" -ForegroundColor DarkGray
+        Write-Host 'prove it once with the dashboard Reboot test (rig page), or restart and watch the PC sign in by itself.' -ForegroundColor DarkGray
+    }
+    if ($failed.Count -and $Action -eq 'WinSet') { $script:checkExit = 1 }
 }
 
 # ---- Rig check (read-only): is this PC ready to mine unattended? ----
@@ -2285,7 +3297,7 @@ function Invoke-RigCheck {
     $ready = $script:ag; $script:ag = $null
     try { $r = Get-AgentReadiness } finally { $script:ag = $ready }
     foreach ($row in @(
-        @('auto_login','Auto-login','Windows signs the user in after a reboot','NOT set: after a reboot the PC waits at the sign-in screen (set it yourself; this script never changes it)'),
+        @('auto_login','Auto-login','Windows signs the user in after a reboot','NOT set: after a reboot the PC waits at the sign-in screen (menu S, row 1)'),
         @('wu_blocked','Windows Update blocked','no automatic updates or restarts','not blocked: run -Action Harden'),
         @('wu_drivers_excluded','Driver updates blocked','Windows Update cannot replace the GPU driver','not blocked: run -Action Harden'),
         @('sleep_off','Sleep and hibernate off','never','not off (or could not tell): run -Action Harden'),
@@ -2337,16 +3349,18 @@ function New-AgentReport {
     return [ordered]@{
         v=1; agent_version=$agentVersion; script_hash=$a.scriptHash; host=(Limit-Text $env:COMPUTERNAME 64); sent_at=(Get-UnixNow)
         elevated=[bool]$script:isAdmin; boot_s=$boot
-        miner=[ordered]@{ running=[bool]$m.running; pid=$m.pid; hashrate_ths=$m.hashrate_ths; shares_accepted=[long]$m.accepted
-            shares_stale=[long]$m.stale; shares_rejected=[long]$m.rejected; uptime_s=$up; restarts=[int]$a.restarts }
+        miner=[ordered]@{ running=[bool]$m.running; pid=$m.pid; hashrate_ths=$m.hashrate_ths; shares_accepted=$(if ($null -ne $m.accepted) { [long]$m.accepted })
+            shares_stale=$(if ($null -ne $m.stale) { [long]$m.stale }); shares_rejected=$(if ($null -ne $m.rejected) { [long]$m.rejected }); uptime_s=$up; restarts=[int]$a.restarts }
         gpu=$gpu
         sys=[ordered]@{ cpu_pct=$cpu; ram_pct=$ram }
         applied=[ordered]@{ revision=[int]$a.mem.revision; run_id=$a.mem.run_id; dry_run=[bool]$script:isDryRun
             power_limit_w=(ConvertTo-NullableInt $act.power_limit_w); core_offset_mhz=[int]$act.core_offset_mhz; mem_offset_mhz=[int]$act.mem_offset_mhz
-            fan_mode=[string]$act.fan_mode; fan_percent=$fanPct }
+            mem_lock_mhz=[int]$act.mem_lock_mhz; fan_mode=[string]$act.fan_mode; fan_percent=$fanPct }
         limits=[ordered]@{ core_min=[int]$script:cfg.core_min; core_max=[int]$script:cfg.core_max; mem_min=[int]$script:cfg.mem_min
             mem_max=[int]$script:cfg.mem_max; fan_min=$agentFanMin }
         readiness=$(try { Get-AgentReadiness } catch { $null })
+        miners=@($(try { (Get-ApprovedMiners) | Select-Object -First 20 | ForEach-Object { [ordered]@{ id=$_.id; name=$_.name; stats=$_.stats } } } catch { }))   # the server takes at most 20
+        profile=$(try { Get-AgentProfileState } catch { $null })
         events=@($a.events | Select-Object -First 20)
         command_results=@($a.results | Select-Object -First 20)
         errors=@($a.errors | Select-Object -First 10)
@@ -2420,7 +3434,13 @@ function Complete-AgentReport {
         if ($resp -and $null -ne (ConvertTo-NullableInt $resp.poll_interval_s)) { $iv = [Math]::Min(60, [Math]::Max(3, (ConvertTo-NullableInt $resp.poll_interval_s))) }
         $script:ag.nextBeat = $now.AddSeconds($iv)
         if ($resp) {
+            # What the dashboard controls right now (the menu marks those values with *): desired fields that are set, and a profile.
+            $managed = @()
+            if ($resp.desired) { foreach ($k in @('power_limit_w','core_offset_mhz','mem_offset_mhz','mem_lock_mhz','fan_mode')) { if ($null -ne $resp.desired.$k) { $managed += $k } } }
+            if ($resp.PSObject.Properties.Name -contains 'profile' -and $null -ne $resp.profile) { $managed += 'profile' }
+            $script:ag.managed = $managed
             try { Invoke-AgentReconcile $resp } catch { Add-AgentError "Reconcile: $($_.Exception.Message)" }
+            try { Invoke-AgentProfile $resp } catch { Add-AgentError "Mining profile: $($_.Exception.Message)" }
             try { Invoke-AgentCommands $resp } catch { Add-AgentError "Commands: $($_.Exception.Message)" }
         }
         return
@@ -2446,7 +3466,8 @@ function Write-AgentState([switch]$Stopped) {
     if ($a.trial) { $tr = [ordered]@{ run_id=$a.trial.run_id; revision=$a.trial.revision; started_at=$a.trial.started_at; ok_s=[int]$a.watch.okS; need_s=$agentTrialConfirmS } }
     $st = [ordered]@{ pid=$PID; beat=(Get-UnixNow); started_at=$a.startedAt; stopped=[bool]$Stopped; dry_run=$script:isDryRun; server_url=$a.url
         last_http=$a.lastHttp; last_ok_at=$a.lastOkAt; backoff_s=$a.backoff; revision=$a.mem.revision; run_id=$a.mem.run_id; trial=$tr
-        cutoff_c=(Get-AgentCutoff); fans=[string]$a.fan.applied; restarts=$a.restarts; pending_events=$a.events.Count; errors=@($a.errors) }
+        cutoff_c=(Get-AgentCutoff); fans=[string]$a.fan.applied; restarts=$a.restarts; pending_events=$a.events.Count; errors=@($a.errors)
+        managed=@($a.managed) }   # settings the dashboard sets: the menu shows them as *ON / *value
     try { Write-JsonFile (Get-AgentFile 'agent-state.json') $st } catch { }
 }
 
@@ -2462,6 +3483,8 @@ function Invoke-AgentTick {
     try { $script:ag.cpu = [PearlSys]::CpuPct(); $script:ag.ram = [PearlSys]::RamPct() } catch { }
     try { Update-AgentFans } catch { Add-AgentError "Fans: $($_.Exception.Message)" }
     try { Invoke-AgentWatch $prev $dt } catch { Add-AgentError "Watchdog: $($_.Exception.Message)" }
+    try { Invoke-ProfileProbation } catch { Add-AgentError "Mining profile check: $($_.Exception.Message)" }
+    try { Invoke-ClockCheck } catch { }
     try { Invoke-AgentKeepAlive } catch { Add-AgentError "Keep-alive: $($_.Exception.Message)" }
     Write-AgentState
 }
@@ -2495,7 +3518,7 @@ function Invoke-Agent {
         fan=@{ applied=$null; at=[DateTime]::MinValue; hot=$false; note=$null }; curve=$null; curveText=$null; offsetCache=$null; seenPid=$null; seenAt=$null
         http=@{ rs=$null; ps=$null; handle=$null; started=$null; events=@(); results=@(); errors=@() }
         nextBeat=[DateTime]::MinValue; backoff=0; lastHttp=$null; lastOkAt=$null; lastTick=$null; autoStartAt=$null; blockedLogged=$null
-        wd=$null; ready=$null; readyAt=$null; rebootAt=$null; driverText=$null
+        wd=$null; ready=$null; readyAt=$null; rebootAt=$null; driverText=$null; profileRefusal=$null; profileWaitLogged=$null; profileProbation=$null; rebootWhy=$null; managed=@()
     }
     $stopFile = Get-AgentFile 'agent.stop'
     try {
@@ -2555,8 +3578,9 @@ function Invoke-Agent {
                 try { Start-AgentReport } catch { Add-AgentError "Report: $($_.Exception.Message)"; $script:ag.nextBeat = $now.AddSeconds(5) }
             }
             if ($script:ag.rebootAt -and [DateTime]::UtcNow -ge $script:ag.rebootAt -and -not $h.handle) {
-                Write-AgentLog 'Watchdog reboot now.' 'Red'
-                Start-Process -FilePath (Join-Path $env:WINDIR 'System32\shutdown.exe') -ArgumentList @('/r','/t','5','/c','Pearl watchdog: restarting an unresponsive rig') -WindowStyle Hidden
+                $why = 'Pearl watchdog: restarting an unresponsive rig'; if ($script:ag.rebootWhy) { $why = [string]$script:ag.rebootWhy }
+                Write-AgentLog "Rebooting now: $why" 'Red'
+                Start-Process -FilePath (Join-Path $env:WINDIR 'System32\shutdown.exe') -ArgumentList @('/r','/t','5','/c',$why) -WindowStyle Hidden
                 $script:ag.rebootAt = $null
             }
             if ($script:ag.restartAt -and [DateTime]::UtcNow -ge $script:ag.restartAt -and -not $h.handle) { $script:updateExit = $true; Write-AgentLog 'Script updated: exiting so the task restarts the agent.' 'Yellow'; break }
@@ -2579,6 +3603,7 @@ function Write-AgentStatusLine {
     Write-Host '  Agent  ' -NoNewline -ForegroundColor DarkGray
     if ($beat) {
         $text = 'RUNNING'; $color = 'Green'
+        if (Test-RemoteLink $beat (Get-UnixNow)) { $text = 'RUNNING | REMOTE: settings come from the server' }
         if ($beat.dry_run) { $text += ' (dry run)' }
         if ($beat.last_ok_at) { $text += " | last report $((Get-UnixNow) - [long]$beat.last_ok_at) s ago" } else { $text += ' | no report yet' }
         if ($beat.last_http -and [int]$beat.last_http.status -ne 200) {
@@ -2598,7 +3623,7 @@ function Write-AgentStatusLine {
 function Show-Menu {
     while ($true) {
         $script:cfg = Get-Config   # the remote agent may have changed it
-        $running = Get-Process -Name krig-miner -ErrorAction SilentlyContinue | Select-Object -First 1
+        $running = Get-MinerProcess | Select-Object -First 1
         $script:cfg.startup = [bool](Test-Path $startupLnk)
         if (-not $script:cfg.startup -and -not (Test-AgentTask)) { $script:cfg.autostart = $false }
         $hrText = ''
@@ -2612,18 +3637,26 @@ function Show-Menu {
         }
         $acct = [string]$script:cfg.mining_username
         if (-not $acct) { $acct = 'not set yet' }
+        $ap = Get-ActiveProfile
         Clear-Host
-        Write-Banner ('Account: {0} | Mode: {1}' -f $acct,$script:cfg.mode)
+        if ($ap) { Write-Banner ('Profile: {0} | {1}' -f $ap.name,$ap.account) } else { Write-Banner ('Account: {0} | {1}' -f $acct,$script:cfg.mode) }
         Write-Host ''
-        Write-Host '  Miner  ' -NoNewline -ForegroundColor DarkGray
-        if ($running) { Write-Host ("RUNNING (PID $($running.Id))$hrText") -ForegroundColor Green }
-        else { Write-Host 'stopped' -ForegroundColor Yellow }
-        Write-Host '  ' -NoNewline
+        # Status panel: miner, GPU (with what the card really runs), agent, unattended readiness
+        Write-Host '  Miner      ' -NoNewline -ForegroundColor DarkGray
+        if ($running) { Write-Pill 'on' $false 'RUNNING'; Write-Host ("  PID $($running.Id)$hrText") -ForegroundColor Green }
+        else { Write-Pill 'off' $false 'STOPPED'; Write-Host '' }
+        Write-Host '             ' -NoNewline
         Write-Host (Get-WorkerStatus) -ForegroundColor DarkGray
+        Write-GpuStatusLine ([bool]$running)
         $agentOn = Write-AgentStatusLine
-        Write-Host ''
-        $su = 'OFF'; $suColor = 'DarkGray'; if ($script:cfg.startup) { $su = 'ON'; $suColor = 'Green' }
-        $as = 'OFF'; $asColor = 'DarkGray'; if ($script:cfg.autostart) { $as = 'ON'; $asColor = 'Green' }
+        $sys = @(); try { $sys = @(Get-SystemRows | Where-Object { $_.Pill -and $_.Key -ne 'B' -and $_.Key -ne '5' }) } catch { }
+        $sysOn = @($sys | Where-Object { $_.Pill -in @('on','fixed') }).Count
+        $sysState = $(if ($sys.Count -eq 0) { 'unknown' } elseif ($sysOn -eq $sys.Count) { 'on' } else { 'off' })
+        Write-Host '  Unattended ' -NoNewline -ForegroundColor DarkGray
+        Write-Pill $sysState $false $(if ($sys.Count) { "{0}/{1}" -f $sysOn,$sys.Count } else { '' })
+        $missing = @($sys | Where-Object { $_.Pill -notin @('on','fixed') } | ForEach-Object { $_.Label.Split('(')[0].Trim() })
+        if ($sys.Count -eq 0) { Write-Host '  could not read the settings (press S)' -ForegroundColor DarkGray }
+        elseif ($missing.Count) { Write-Host ('  off: ' + ($missing -join ', ') + '  (press S)') -ForegroundColor Yellow } else { Write-Host '  everything for unattended mining is on' -ForegroundColor Green }
         $elTag = 'not admin'; $elColor = 'DarkYellow'; if ($script:isAdmin) { $elTag = 'ACTIVE'; $elColor = 'Green' }
         $pcTag = $env:COMPUTERNAME; $pcTagColor = 'DarkGray'
         $pendingName = Get-PendingComputerName
@@ -2633,20 +3666,24 @@ function Show-Menu {
         if ($script:cfg.mode -eq 'SOLO') { $soloTag = 'last used' } else { $ppsTag = 'last used' }
         $agTag = 'OFF'; $agColor = 'DarkGray'; if ($agentOn) { $agTag = 'ON'; $agColor = 'Green' }
         $updTag = ''; if ($agentOn) { $updTag = 'off: agent' }
+        $profTag = ''; if ($ap) { $profTag = "profile: $($ap.name)" }
         $items = @(
+            New-MenuHeader 'Mining'
             New-MenuItem '1' 'Start PPS mining' $ppsTag 'DarkGray'
             New-MenuItem '2' 'Start SOLO mining' $soloTag 'DarkGray'
             New-MenuItem '3' 'Stop miner'
             New-MenuItem '4' 'Live TH/s and earnings summary'
-            New-MenuItem '5' 'Start this menu with Windows' $su $suColor
-            New-MenuItem '6' 'Auto-start mining after restart' $as $asColor
-            New-MenuItem '7' 'Earnings yield (BTC per TH/s/day)' ([string]$script:cfg.btc_per_th_day) 'Yellow'
-            New-MenuItem '8' 'GPU settings (power, clock offsets)'
-            New-MenuItem '9' 'Update script from GitHub' $updTag 'DarkGray'
+            New-MenuHeader 'Setup'
+            New-MenuItem '8' 'GPU settings (power, clocks, locks, fans)'
+            New-StatusItem 'S' 'System & auto-start (auto-login, updates, restarts)' $sysState $false '' $(if ($sys.Count) { "{0}/{1}" -f $sysOn,$sys.Count } else { '' })
             New-MenuItem 'A' 'Remote agent: set up server and rig key' $agTag $agColor
             New-MenuItem 'R' 'Remote agent: remove'
+            New-MenuItem 'M' 'Miners approved for dashboard profiles' $profTag 'Cyan'
+            New-MenuHeader 'This PC'
             New-MenuItem 'W' 'Worker name suffix' $wkSfx 'Yellow'
             New-MenuItem 'N' 'Rename this PC (needs reboot)' $pcTag $pcTagColor
+            New-MenuItem '7' 'Earnings yield (BTC per TH/s/day)' ([string]$script:cfg.btc_per_th_day) 'Yellow'
+            New-MenuItem '9' 'Update script from GitHub' $updTag 'DarkGray'
             New-MenuItem 'D' 'Put in Documents (1_pearl_miner)'
             New-MenuItem 'E' 'Elevate (restart as administrator)' $elTag $elColor
             New-MenuItem '0' 'Exit menu (miner keeps running)'
@@ -2660,26 +3697,7 @@ function Show-Menu {
                 '2' { Start-MinerInMode 'SOLO'; Set-MinerWanted $true }
                 '3' { Set-MinerWanted $false; Stop-Miner }
                 '4' { Show-Summary; $pause = $false }
-                '5' {
-                    $new = -not [bool]$script:cfg.startup
-                    Set-StartupHook $new
-                    $script:cfg.startup = $new
-                    if (-not $new) { $script:cfg.autostart = $false }
-                    Save-Config
-                    Write-Host ('Windows startup: {0}' -f $(if ($new) { 'ON' } else { 'OFF' }))
-                    if (-not $new) { Write-Host 'Auto-start mining was also turned OFF.' }
-                }
-                '6' {
-                    $new = -not [bool]$script:cfg.autostart
-                    if ($new -and -not $script:cfg.startup) {
-                        Set-StartupHook $true
-                        $script:cfg.startup = $true
-                        Write-Host 'Windows startup was turned ON (required for auto-start).'
-                    }
-                    $script:cfg.autostart = $new
-                    Save-Config
-                    Write-Host ('Auto-start mining after restart: {0}' -f $(if ($new) { 'ON' } else { 'OFF' }))
-                }
+                'S' { Show-SystemSettings; $pause = $false }
                 '7' {
                     $v = (Read-Host 'BTC per TH/s per day (e.g. 0.0000001, 0 to clear)').Trim().Replace(',','.')
                     $d = 0.0
@@ -2691,6 +3709,7 @@ function Show-Menu {
                 '9' { Start-SelfUpdate; Start-Sleep -Seconds 1; return }
                 'A' { Set-AgentSetup }
                 'R' { Remove-AgentSetup }
+                'M' { Show-ApprovedMiners; $pause = $false }
                 'W' { Set-WorkerSuffix }
                 'N' { Set-PcName }
                 'D' { Install-ToDocuments }
@@ -2704,7 +3723,7 @@ function Show-Menu {
 }
 
 $script:isAdmin = Test-Admin
-$script:isDryRun = ($Action -in @('Agent','Harden','Unharden') -and [bool]$DryRun)   # set before anything can save or change settings
+$script:isDryRun = ($Action -in @('Agent','Harden','Unharden','WinSet') -and [bool]$DryRun)   # set before anything can save or change settings
 # A window opened directly as powershell.exe uses the blue PowerShell palette; force black.
 if (-not [Console]::IsInputRedirected) {
     try { $Host.UI.RawUI.BackgroundColor = 'Black'; $Host.UI.RawUI.ForegroundColor = 'Gray'; Clear-Host } catch { }
@@ -2726,6 +3745,12 @@ switch ($Action) {
     'Setup'   { Set-AgentSetup -Unattended }
     'Harden'   { Invoke-HardenAction $false }
     'Unharden' { Invoke-HardenAction $true }
+    'WinSet'   {
+        # one row of menu S, elevated (the menu re-launches itself here with -Setting/-Value)
+        if (-not $Setting -or -not $Value) { throw '-Action WinSet needs -Setting <row> -Value on|off.' }
+        Invoke-HardenAction ($Value -eq 'off') $Setting
+        if ($script:checkExit) { exit $script:checkExit }
+    }
     'Check'    { Invoke-RigCheck; if ($script:checkExit) { exit $script:checkExit } }
     'Agent'   { Invoke-Agent; if ($script:updateExit) { exit 1 } }   # non-zero exit: the task restarts the agent (on the new script after an update)
     default {
