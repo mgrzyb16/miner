@@ -64,7 +64,8 @@ function Get-Config {
            core_min=-500; core_max=300; mem_min=-1000; mem_max=1500; worker_suffix=''
            fan_mode='auto'; fan_percent=60; fan_curve='50:35,60:50,70:65,75:75,80:90,85:100'
            power_limit_w=0; server_url=''; temp_cutoff_c=85
-           miner_wanted=$false; miner_wanted_by=''; watchdog='restart' }   # miner_wanted_by: 'dashboard' when a dashboard command set it last
+           miner_wanted=$false; miner_wanted_by=''; watchdog='restart'    # miner_wanted_by: 'dashboard' when a dashboard command set it last
+           agent_menu=$true; menu_script='' }   # agent_menu: the agent opens the menu on screen; menu_script: where the menu last ran from
     if (Test-Path $configFile) {
         $saved = Get-Content $configFile -Raw | ConvertFrom-Json
         foreach ($p in $saved.PSObject.Properties) { if ($c.Contains($p.Name)) { $c[$p.Name] = $p.Value } }
@@ -505,11 +506,15 @@ function Show-Summary {
 
 function Set-StartupHook([bool]$On) {
     if ($On) {
+        # From the agent's copy (the menu the agent opened), point at the user's own copy: the agent's copy goes away with option R.
+        $target = $scriptPath
+        $m = [string]$script:cfg.menu_script
+        if ($script:isProtectedCopy -and $m -and (Test-Path -LiteralPath $m)) { $target = $m }
         $sh = New-Object -ComObject WScript.Shell
         $l = $sh.CreateShortcut($startupLnk)
         $l.TargetPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $l.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $scriptPath + '" -Boot -InstallDir "' + $InstallDir + '"'
-        $l.WorkingDirectory = Split-Path $scriptPath
+        $l.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $target + '" -Boot -InstallDir "' + $InstallDir + '"'
+        $l.WorkingDirectory = Split-Path $target
         $l.Description = 'Pearl miner menu'
         $l.Save()
     } elseif (Test-Path $startupLnk) { Remove-Item $startupLnk -Force }
@@ -986,7 +991,8 @@ function Wait-Key {
 }
 
 # Arrow-key menu: Up/Down/Home/End + Enter, or press an item's key. Esc or Q returns '0'.
-function Select-Menu([string]$Name,[object[]]$Items) {
+# $RefreshS > 0: returns '' after that many seconds without a key, so the caller can redraw with fresh readings.
+function Select-Menu([string]$Name,[object[]]$Items,[int]$RefreshS = 0) {
     if ([Console]::IsInputRedirected) { return (Read-Host 'Select').Trim() }
     # the position is remembered by key, not by index: rows that come and go do not move the cursor to another item
     $idx = Get-NextMenuIndex $Items -1 1
@@ -1003,6 +1009,13 @@ function Select-Menu([string]$Name,[object[]]$Items) {
             Write-Host ''
             Write-Host '  Up/Down + Enter, or press the key.  Esc = back' -ForegroundColor DarkGray
             if ($top -lt 0) { $top = [Console]::CursorTop - $lines - 2 }
+            if ($RefreshS -gt 0) {
+                $until = (Get-Date).AddSeconds($RefreshS)
+                while (-not [Console]::KeyAvailable) {
+                    if ((Get-Date) -ge $until) { $script:menuPos[$Name] = $Items[$idx].Key; return '' }
+                    Start-Sleep -Milliseconds 100
+                }
+            }
             $k = [Console]::ReadKey($true)
             $key = $k.Key
             if ($key -eq [ConsoleKey]::UpArrow) { $idx = Get-NextMenuIndex $Items $idx -1 }
@@ -1235,6 +1248,7 @@ function Get-SystemRows([switch]$Fresh) {
         New-StatusItem '3' 'Mining starts by itself after a restart' $(if ($wanted) { 'on' } else { 'off' }) ([string]$script:cfg.miner_wanted_by -eq 'dashboard') $(if ($script:cfg.miner_wanted_by -eq 'dashboard') { 'set by the dashboard' } else { '' })
         New-StatusItem '4' 'Watchdog restarts a stuck miner' $(if ($wd -eq 'off') { 'off' } else { 'on' }) $false $(if ($wd -eq 'reboot') { 'and reboots the PC as a last resort' } else { '' }) $(if ($wd -eq 'off') { 'OFF' } else { $wd.ToUpperInvariant() })
         New-StatusItem '5' 'Menu window opens at Windows start' $(if (Test-Path -LiteralPath $startupLnk) { 'on' } else { 'off' }) $false 'optional: the agent does the mining'
+        New-StatusItem 'M' 'Agent opens this menu on screen' $(if ([bool]$script:cfg.agent_menu) { 'on' } else { 'off' }) $false $(if ($agentTask) { 'at sign-in and after a dashboard update' } else { 'needs the agent' })
         New-MenuHeader 'Keep Windows out of the way'
         New-StatusItem '6' $hardenGroups['updates'] $g['updates'].state $false (& $part $g['updates'])
         New-StatusItem '7' $hardenGroups['restarts'] $g['restarts'].state $false (& $part $g['restarts'])
@@ -1298,6 +1312,10 @@ function Show-SystemSettings {
                     Set-StartupHook $on
                     if (-not $on -and -not (Test-AgentTask)) { $script:cfg.autostart = $false; Save-Config; Write-Host 'Without the agent, auto-start mining was switched off too.' -ForegroundColor Yellow }
                     Write-Host ('Menu at Windows start: {0}' -f $(if ($on) { 'ON' } else { 'OFF' }))
+                }
+                'M' {
+                    $script:cfg.agent_menu = -not [bool]$script:cfg.agent_menu; Save-Config
+                    Write-Host ('The agent opens this menu on screen: {0}. Applies from its next start (sign-in, a dashboard update, a restart).' -f $(if ($script:cfg.agent_menu) { 'ON' } else { 'OFF' }))
                 }
                 { $_ -in @('6','7','8','9','F','P') } {
                     $grp = @{ '6'='updates'; '7'='restarts'; '8'='drivers'; '9'='sleep'; 'F'='faststartup'; 'P'='powersave' }[$c]
@@ -1586,7 +1604,8 @@ try {
     # Protected copy: Program Files is writable only by administrators, so a user-level process cannot edit what runs elevated.
     $pd = {PDIR}
     New-Item -ItemType Directory -Force -Path $pd | Out-Null
-    Copy-Item -LiteralPath {SRC} -Destination (Join-Path $pd 'Start-Pearl.ps1') -Force
+    # Set up again from the menu the agent opened: that menu already runs the protected copy.
+    if ({SRC} -ine (Join-Path $pd 'Start-Pearl.ps1')) { Copy-Item -LiteralPath {SRC} -Destination (Join-Path $pd 'Start-Pearl.ps1') -Force }
     {HARDEN}
     if (Test-Path -LiteralPath {MINER}) { (Get-FileHash -LiteralPath {MINER} -Algorithm SHA256).Hash | Set-Content -LiteralPath (Join-Path $pd 'miner.sha256') -Encoding ASCII }
     $a = New-ScheduledTaskAction -Execute {EXE} -Argument {ARGS} -WorkingDirectory {DIR}
@@ -1920,7 +1939,8 @@ function Invoke-AgentTaskScript([string]$Text,[string]$What) {
 function Set-AgentSetup([switch]$Unattended) {
     if (-not $scriptPath) { throw 'Run this from a saved .ps1 file.' }
     Write-Host 'The remote agent reports this rig to your fleet server every few seconds and applies the power limit,'
-    Write-Host 'clock offsets and fan settings chosen there. It runs hidden and elevated from a scheduled task at logon.'
+    Write-Host 'clock offsets and fan settings chosen there. It runs hidden and elevated from a scheduled task at logon,'
+    Write-Host 'and opens this menu on the screen a minute after it starts (menu S, row M turns that off).'
     Write-Host 'While it runs, settings set on the server override power/offset/fan changes made in this menu.' -ForegroundColor Yellow
     Write-Host ''
     $cur = [string]$script:cfg.server_url
@@ -1959,6 +1979,7 @@ function Set-AgentSetup([switch]$Unattended) {
         $plain = $null
     }
     $script:cfg.server_url = $u
+    if (-not $script:isProtectedCopy) { $script:cfg.menu_script = $scriptPath }   # the copy the agent keeps up to date for the menu
     Save-Config
     Write-Host 'Saved. The key is encrypted for this Windows user (DPAPI).' -ForegroundColor Green
     # The task runs as this same user, so it can decrypt the key; captured here, before any elevation.
@@ -1988,6 +2009,112 @@ function Remove-AgentSetup {
     Remove-Item -LiteralPath $stopFile -Force -ErrorAction SilentlyContinue
     if (Test-AgentTask) { Invoke-AgentTaskScript (Get-AgentTaskScript $agentTaskRemove '') 'remove the Pearl Agent scheduled task' }
     Write-Host 'Remote agent removed. The server URL and rig key stay saved for a later setup (delete agent-key.dat to forget the key).' -ForegroundColor Green
+    if ($script:isProtectedCopy) {
+        # This menu ran from the agent's copy, which the removal just deleted: options that reopen the script would fail.
+        $m = [string]$script:cfg.menu_script
+        if ($m -and (Test-Path -LiteralPath $m)) { Write-Host "This window closes. Open the menu again from $(Split-Path $m) (Start-Pearl.cmd)." -ForegroundColor Yellow }
+        else { Write-Host 'This window closes. Open the menu again with Start-Pearl.cmd from your script folder.' -ForegroundColor Yellow }
+        Wait-Key
+        exit 0
+    }
+}
+
+# ---- The menu on the rig's screen (the agent itself runs hidden) ----
+# Once per agent start (sign-in, a dashboard update, a restart after a crash), a minute in so a menu the Startup shortcut opens is not
+# doubled, the agent opens the menu from its own protected copy if none is open. It never closes a menu: someone may be typing in it.
+# Menus reopen themselves on a newer script when idle (Invoke-MenuReload). The copies people open by hand (Start-Pearl.cmd) are refreshed
+# from the protected copy at the same time, because option 9 is off under the agent and the dashboard only updates the protected copy.
+$agentMenuDelayS = 60
+
+# The script a menu window runs, from its process command line; $null for anything else (the agent, the fan controller, an updater,
+# Stop-Pearl.cmd, an elevated Windows-settings window, -Action Summary ...). Pure, so it is tested with real command lines.
+function Get-MenuScriptFromCommandLine([string]$CommandLine) {
+    if ($CommandLine -notmatch '(?i)\s-File\s+(?:"([^"]+)"|(\S+))(.*)$') { return $null }
+    $path = $Matches[2]; if ($Matches[1]) { $path = $Matches[1] }
+    $rest = $Matches[3]
+    if ($path -notmatch '(?i)(^|[\\/])Start-Pearl\.ps1$') { return $null }
+    if ($rest -match '(?i)(^|\s)-Action\s+"?(\w+)' -and $Matches[2] -ine 'Menu') { return $null }
+    if ($rest -match '(?i)(^|\s)-(Stop|SetupOnly|UpdateTarget)(\s|$)') { return $null }
+    return $path
+}
+
+function Get-MenuWindows {
+    $sid = (Get-Process -Id $PID).SessionId
+    $out = @()
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction Stop)) {
+        if ($p.ProcessId -eq $PID -or $p.SessionId -ne $sid) { continue }
+        $path = Get-MenuScriptFromCommandLine ([string]$p.CommandLine)
+        if ($path) { $out += [pscustomobject]@{ Pid=[int]$p.ProcessId; Path=$path } }
+    }
+    return $out
+}
+
+# A copy is refreshed only if it is this script (marker, under 2 MB), a plain file in a plain folder (no link or junction an elevated
+# write could be redirected through), not the protected copy itself, and different from it.
+function Test-MenuCopyTarget([string]$Path,[string]$Protected,[string]$ProtectedHash) {
+    try {
+        if ($Path -notmatch '(?i)(^|[\\/])Start-Pearl\.ps1$') { return $false }
+        $f = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($f.FullName -ieq [IO.Path]::GetFullPath($Protected)) { return $false }
+        if (($f.Attributes -band [IO.FileAttributes]::ReparsePoint) -or ($f.Directory.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+        if ($f.Length -gt 2MB -or (Get-Content -LiteralPath $f.FullName -Raw) -notmatch 'PEARL-POW') { return $false }
+        return ((Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash -ne $ProtectedHash)
+    } catch { return $false }
+}
+
+# Where people open the menu by hand: Documents\1_pearl_miner (option D), the copy the menu last ran from, the Startup shortcut, open menus.
+function Get-MenuCopyCandidates {
+    $c = @((Join-Path ([Environment]::GetFolderPath('MyDocuments')) '1_pearl_miner\Start-Pearl.ps1'), [string]$script:cfg.menu_script)
+    if (Test-Path -LiteralPath $startupLnk) {
+        try { $c += Get-MenuScriptFromCommandLine (' ' + (New-Object -ComObject WScript.Shell).CreateShortcut($startupLnk).Arguments) } catch { }
+    }
+    try { foreach ($w in @(Get-MenuWindows)) { $c += $w.Path } } catch { }
+    return @($c | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+function Update-MenuCopies {
+    if (-not $script:isProtectedCopy -or (Test-DryRunSkip 'refresh the menu copies of the script')) { return }
+    $hash = (Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256).Hash
+    foreach ($p in @(Get-MenuCopyCandidates)) {
+        if (-not (Test-MenuCopyTarget $p $scriptPath $hash)) { continue }
+        try { Copy-Item -LiteralPath $scriptPath -Destination $p -Force; Write-AgentLog "Menu copy $p updated to this agent's script ($($script:ag.scriptHash))." }
+        catch { Write-AgentLog "Could not update the menu copy ${p}: $($_.Exception.Message)" 'Yellow' }
+    }
+}
+
+# Elevated, like the agent that starts it: settings changed in it need no Windows prompt.
+function Open-AgentMenu {
+    if (-not $script:isProtectedCopy -or -not [bool]$script:cfg.agent_menu -or (Test-DryRunSkip 'open the menu window')) { return }
+    $open = @(Get-MenuWindows)
+    if ($open.Count) { Write-AgentLog "A menu window is open (PID $($open[0].Pid)); not opening another."; return }
+    Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -WindowStyle Normal -ArgumentList @(
+        '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptPath + '"'),'-InstallDir',('"' + $InstallDir + '"'))
+    Write-AgentLog 'Opened the menu window on this PC''s screen.'
+}
+
+# The script file this menu runs from was replaced (a dashboard update of the agent's copy, or the agent refreshing this copy): from the
+# idle main screen, reopen the menu on the new version in this same window. A file that does not parse is skipped until it changes again.
+$script:menuStamp = $null
+function Get-ScriptStamp {
+    try { $i = Get-Item -LiteralPath $scriptPath -ErrorAction Stop; return '{0}|{1}' -f $i.Length,$i.LastWriteTimeUtc.Ticks } catch { return $null }
+}
+
+function Invoke-MenuReload {
+    if (-not $scriptPath -or -not $script:menuStamp) { return $false }
+    $now = Get-ScriptStamp
+    if (-not $now -or $now -eq $script:menuStamp) { return $false }
+    $script:menuStamp = $now
+    $errs = $null
+    try { [void][System.Management.Automation.Language.Parser]::ParseFile($scriptPath,[ref]$null,[ref]$errs) } catch { return $false }
+    if ($errs -and $errs.Count) { return $false }
+    Clear-Host
+    Write-Host 'A new version of this script was installed. Reopening the menu on it ...' -ForegroundColor Green
+    # Not "& powershell.exe": the caller captures this function's output, and a new menu writing into a pipe has no console to draw on.
+    # Not -Wait either: that also waits for a miner the new menu starts.
+    $p = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -NoNewWindow -PassThru -ArgumentList @(
+        '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptPath + '"'),'-InstallDir',('"' + $InstallDir + '"'))
+    $p.WaitForExit()
+    return $true
 }
 
 # ---- Readings ----
@@ -3519,6 +3646,7 @@ function Invoke-Agent {
         http=@{ rs=$null; ps=$null; handle=$null; started=$null; events=@(); results=@(); errors=@() }
         nextBeat=[DateTime]::MinValue; backoff=0; lastHttp=$null; lastOkAt=$null; lastTick=$null; autoStartAt=$null; blockedLogged=$null
         wd=$null; ready=$null; readyAt=$null; rebootAt=$null; driverText=$null; profileRefusal=$null; profileWaitLogged=$null; profileProbation=$null; rebootWhy=$null; managed=@()
+        menuAt=[DateTime]::UtcNow.AddSeconds($agentMenuDelayS)
     }
     $stopFile = Get-AgentFile 'agent.stop'
     try {
@@ -3584,6 +3712,16 @@ function Invoke-Agent {
                 $script:ag.rebootAt = $null
             }
             if ($script:ag.restartAt -and [DateTime]::UtcNow -ge $script:ag.restartAt -and -not $h.handle) { $script:updateExit = $true; Write-AgentLog 'Script updated: exiting so the task restarts the agent.' 'Yellow'; break }
+            if ($script:ag.menuAt -and [DateTime]::UtcNow -ge $script:ag.menuAt) {
+                # After an update, only once the new script reached the server (the rollback marker is gone): a rollback must not leave
+                # the menu copies on the version it undid.
+                if (Test-Path -LiteralPath (Get-AgentFile 'update-pending.json')) { $script:ag.menuAt = [DateTime]::UtcNow.AddSeconds($agentMenuDelayS) }
+                else {
+                    $script:ag.menuAt = $null
+                    try { Update-MenuCopies } catch { Write-AgentLog "Menu copies: $($_.Exception.Message)" 'Yellow' }
+                    try { Open-AgentMenu } catch { Write-AgentLog "Menu window: $($_.Exception.Message)" 'Yellow' }
+                }
+            }
             Start-Sleep -Milliseconds 200
         }
     } finally {
@@ -3620,7 +3758,13 @@ function Write-AgentStatusLine {
     return ($beat -or $task)
 }
 
+$menuRefreshS = 10   # the main screen redraws with fresh readings this often while nobody presses a key
 function Show-Menu {
+    $script:menuStamp = Get-ScriptStamp
+    # Remember where the menu runs from: the agent keeps this copy up to date (Update-MenuCopies).
+    if (-not $script:isProtectedCopy -and $scriptPath -and [string]$script:cfg.menu_script -ne $scriptPath) {
+        $script:cfg.menu_script = $scriptPath; try { Save-Config } catch { }
+    }
     while ($true) {
         $script:cfg = Get-Config   # the remote agent may have changed it
         $running = Get-MinerProcess | Select-Object -First 1
@@ -3649,7 +3793,7 @@ function Show-Menu {
         Write-Host (Get-WorkerStatus) -ForegroundColor DarkGray
         Write-GpuStatusLine ([bool]$running)
         $agentOn = Write-AgentStatusLine
-        $sys = @(); try { $sys = @(Get-SystemRows | Where-Object { $_.Pill -and $_.Key -ne 'B' -and $_.Key -ne '5' }) } catch { }
+        $sys = @(); try { $sys = @(Get-SystemRows | Where-Object { $_.Pill -and $_.Key -notin @('B','5','M') }) } catch { }
         $sysOn = @($sys | Where-Object { $_.Pill -in @('on','fixed') }).Count
         $sysState = $(if ($sys.Count -eq 0) { 'unknown' } elseif ($sysOn -eq $sys.Count) { 'on' } else { 'off' })
         Write-Host '  Unattended ' -NoNewline -ForegroundColor DarkGray
@@ -3688,7 +3832,8 @@ function Show-Menu {
             New-MenuItem 'E' 'Elevate (restart as administrator)' $elTag $elColor
             New-MenuItem '0' 'Exit menu (miner keeps running)'
         )
-        $c = Select-Menu 'main' $items
+        $c = Select-Menu 'main' $items $menuRefreshS
+        if ($c -eq '') { if (Invoke-MenuReload) { return }; continue }   # idle: redraw, or reopen on a newer script
         Write-Host ''
         $pause = $true
         try {
