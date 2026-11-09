@@ -2,10 +2,12 @@
 <# Pearl-POW / PRL, one RTX 4090 per Windows 11 PC.
    Interactive menu: start/stop the miner, live summary, optional Windows startup.
    The miner runs in its own console window; closing this menu never stops it.
-   Nothing starts automatically unless you switch it on in menu S (System & auto-start).
+   Auto-start is switched on in menu S (System & auto-start); a started miner also comes back after a restart (see below).
    Downloads KRig 1.5.9 from its publisher and verifies the pinned SHA-256.
    Does not change GPU tuning, antivirus, firewall, or power settings.
    Options 5/6 create (or remove) one shortcut in your per-user Startup folder.
+   Every miner start also writes 'Pearl Miner (last start)' there: it repeats that start after a sign-in unless a miner already
+   runs (see Save-LastMinerStart). A deliberate stop removes it.
    Option A sets up the remote agent (-Action Agent): an elevated scheduled task that reports to your fleet server and
    applies the power limit, clock offsets and fan settings chosen there. -Action Agent -DryRun only logs what it would do.
 #>
@@ -46,6 +48,11 @@ $pool = 'stratum+ssl://prl-eu.kryptex.network:8048'
 $configFile = Join-Path $InstallDir 'config.json'
 $minerStopFile = Join-Path $InstallDir 'miner-stop.json'   # written by Stop-Miner: tells the agent a stop was on purpose
 $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Pearl Miner.lnk'
+# Every miner start repeats itself at the next sign-in through this second shortcut (see Save-LastMinerStart).
+$lastMinerLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Pearl Miner (last start).lnk'
+$lastMinerTask = 'Pearl Last Miner'
+$lastMinerProtDir = Join-Path $env:ProgramFiles 'PearlLastMiner'
+$lastMinerDelayS = 180   # after the agent's own start (90 s after boot), so the two do not race
 $scriptPath = $PSCommandPath
 # True when this is the administrator-owned copy the elevated task runs (see Set-AgentSetup); then the miner hash pin must exist.
 $script:isProtectedCopy = [bool]($scriptPath -and ((Split-Path $scriptPath) -ieq (Join-Path $env:ProgramFiles 'PearlAgent')))
@@ -423,6 +430,18 @@ function Start-Miner([string]$StartMode,[switch]$NonInteractive) {
     }
     $p = Start-Process @sp
     Write-Host "Miner started in its own window (PID $($p.Id)). Logs: $logDir" -ForegroundColor Green
+    # The same start again after a restart and sign-in (Startup shortcut), whatever else fails then.
+    try {
+        $plW = [int]$script:cfg.power_limit_w
+        $needAdm = ($co -ne 0 -or $mo -ne 0 -or $ml -gt 0 -or $cl -gt 0 -or $plW -gt 0)
+        $lmArgs = @{ Exe=$exe; ArgsList=[string[]]$argsList; NativeLog=$nativeLog; Sha256=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+                     ProcessNames=[string[]]@(@(Get-ApprovedMiners) | ForEach-Object { [string]$_.process }); PowerLimitW=$plW; NeedsAdmin=$needAdm
+                     Smi=[string](Find-Smi); Dir=$InstallDir; Tag=("$modeText-$w" -replace '[^A-Za-z0-9_-]','') }
+        $lmRec = @((Get-LastMinerRecord @lmArgs), (Get-LastMinerRecord @lmArgs -Plain))
+        # A tuning trial may be what crashes the rig: its start is saved only once the trial is confirmed (Complete-AgentTrial).
+        if ($script:agentMode -and $script:ag -and $script:ag.trial) { $script:ag.lastMinerHeld = $lmRec }
+        else { if ($script:ag) { $script:ag.lastMinerHeld = $null }; Save-LastMinerStart $lmRec[0] $lmRec[1] }
+    } catch { Write-Host "Could not save the miner start for the next sign-in: $($_.Exception.Message)" -ForegroundColor Yellow }
     if ($script:agentMode) { return }   # the remote agent drives the fans itself (and checks the clocks every tick)
     if ($ml -gt 0 -or $cl -gt 0) {
         # Check on the card itself that the locks took: KRig applies them once mining starts, a few seconds after launch.
@@ -571,6 +590,173 @@ function Set-StartupHook([bool]$On) {
         $l.Description = 'Pearl miner menu'
         $l.Save()
     } elseif (Test-Path $startupLnk) { Remove-Item $startupLnk -Force }
+}
+
+# ---- The last miner start, repeated at sign-in ----
+# Every miner start (menu, -Action Start, -Boot, the agent) saves how the miner was started and puts a shortcut in the Startup folder
+# that starts it again the same way after a sign-in, $lastMinerDelayS in, unless a miner runs by then. It does not depend on the
+# agent, the autostart setting or the menu, so a reboot brings mining back even when those fail. A deliberate stop (Set-MinerWanted
+# $false) removes the shortcut. Clock offsets, clock locks and the power limit need administrator rights, which Windows never gives a
+# Startup shortcut: then the shortcut runs an elevated scheduled task with no trigger ("schtasks /run" starts a task the user
+# registered without a UAC prompt), and that task's launcher and record live in Program Files, so a user-level process cannot change
+# what runs elevated. Fans are left to the driver (or the agent) after a restore.
+
+# The record of one start. =0 offset flags are dropped (they clear what an earlier miner left on the card; after a reboot it is clean)
+# and the log file becomes {LOGFILE}: each restore logs to a folder of its own. -Plain drops KRig's offset and lock flags and the power
+# limit too: the user-level fallback when the elevated task cannot be saved.
+function Get-LastMinerRecord([string]$Exe,[string[]]$ArgsList,[string]$NativeLog,[string]$Sha256,[string[]]$ProcessNames,
+                             [int]$PowerLimitW,[bool]$NeedsAdmin,[string]$Smi,[string]$Dir,[string]$Tag,[switch]$Plain) {
+    $out = @()
+    foreach ($a in $ArgsList) {
+        $s = [string]$a
+        if ($s -match '^--gpu-(coffset|moffset)=0$') { continue }
+        if ($Plain -and $s -match '^--gpu-(coffset|moffset|mclock|cclock)=') { continue }
+        if ($NativeLog) { $s = $s.Replace($NativeLog,'{LOGFILE}') }
+        $out += $s
+    }
+    $pl = [Math]::Max(0,$PowerLimitW); if ($Plain) { $pl = 0 }
+    return [ordered]@{ exe=$Exe; args=[string[]]$out; sha256=$Sha256; process_names=[string[]]@($ProcessNames | Where-Object { $_ } | Select-Object -Unique)
+                       power_limit_w=$pl; smi=$Smi; install_dir=$Dir; tag=$Tag; delay_s=$lastMinerDelayS; elevated=($NeedsAdmin -and -not $Plain) }
+}
+
+# Runs from the Startup shortcut (user level) or from the elevated task (the Program Files copy). Reads last-miner.json next to itself.
+$lastMinerLauncher = @'
+# Pearl: starts the miner again the way it was last started. Written by Start-Pearl.ps1 at every miner start; do not edit.
+$ErrorActionPreference = 'Stop'
+$dir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$log = $null
+function Out-Log([string]$Text,[string]$Color = 'Gray') {
+    Write-Host $Text -ForegroundColor $Color
+    if ($log) { try { Add-Content -LiteralPath $log -Value ((Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + ' ' + $Text) } catch { } }
+}
+try {
+    $f = Join-Path $dir 'last-miner.json'
+    $r = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
+    $log = Join-Path $r.install_dir 'last-miner.log'
+    $saved = (Get-Item -LiteralPath $f).LastWriteTime.ToString('yyyy-MM-dd HH:mm')
+    $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    Out-Log "Launcher in $dir, admin=$admin."
+    Out-Log ('Sign-in: the miner as last started ({0}) starts in {1} s unless a miner runs by then. Close this window to skip.' -f $saved,[int]$r.delay_s) 'Yellow'
+    Start-Sleep -Seconds ([int]$r.delay_s)
+    $running = { foreach ($n in @($r.process_names)) { if (Get-Process -Name $n -ErrorAction SilentlyContinue) { return $n } }; return $null }
+    $n = & $running
+    if ($n) { Out-Log "A miner ($n) is already running: nothing to do."; exit 0 }
+    if (-not (Test-Path -LiteralPath $r.exe)) { throw "the miner is not there any more: $($r.exe)" }
+    if ((Get-FileHash -LiteralPath $r.exe -Algorithm SHA256).Hash -ne $r.sha256) { throw "the miner changed since it was last started (SHA-256 differs): $($r.exe)" }
+    if ($r.elevated -and -not $admin) { Out-Log 'Not running as administrator: clock offsets, locks and the power limit will not take.' 'Yellow' }
+    if ([int]$r.power_limit_w -gt 0) {
+        if (-not $admin) { Out-Log 'Power limit not set (needs administrator rights).' 'Yellow' }
+        elseif (-not $r.smi -or -not (Test-Path -LiteralPath $r.smi)) { Out-Log 'Power limit not set: nvidia-smi not found.' 'Yellow' }
+        else {
+            & $r.smi -i 0 -pl ([string][int]$r.power_limit_w) | Out-Null
+            if ($LASTEXITCODE -eq 0) { Out-Log "Power limit set to $([int]$r.power_limit_w) W." } else { Out-Log "nvidia-smi could not set the power limit (exit $LASTEXITCODE)." 'Yellow' }
+        }
+    }
+    $logDir = Join-Path $r.install_dir ('logs\' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + $r.tag + '-signin')
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $minerLog = Join-Path $logDir 'miner.log'
+    $argv = @(@($r.args) | ForEach-Object { ([string]$_).Replace('{LOGFILE}',$minerLog) })
+    $sp = @{ FilePath=$r.exe; WorkingDirectory=(Split-Path $r.exe); WindowStyle='Normal'; PassThru=$true }
+    if ($argv.Count) { $sp.ArgumentList = $argv }
+    $n = & $running   # again: another start may have come in during the checks above
+    if ($n) { Out-Log "A miner ($n) started meanwhile: nothing to do."; exit 0 }
+    $p = Start-Process @sp
+    Out-Log "Miner started (PID $($p.Id)). Logs: $logDir" 'Green'
+    Start-Sleep -Seconds 5
+} catch {
+    Out-Log "Could not start the miner: $($_.Exception.Message)" 'Red'
+    Start-Sleep -Seconds 120
+    exit 1
+}
+'@
+
+# Elevated: the launcher and its record into Program Files, and the task the Startup shortcut runs.
+$lastMinerInstall = @'
+$ErrorActionPreference = 'Stop'
+try {
+    $pd = {PDIR}
+    New-Item -ItemType Directory -Force -Path $pd | Out-Null
+    $enc = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText((Join-Path $pd 'last-miner.ps1'), {LAUNCHER}, $enc)
+    [IO.File]::WriteAllText((Join-Path $pd 'last-miner.json'), {JSON}, $enc)
+    $a = New-ScheduledTaskAction -Execute {EXE} -Argument {ARGS} -WorkingDirectory $pd
+    $p = New-ScheduledTaskPrincipal -UserId {USER} -LogonType Interactive -RunLevel Highest
+    $s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskName {NAME} -Action $a -Principal $p -Settings $s -Force `
+        -Description 'Pearl: start the miner as it was last started (run by the Pearl Miner (last start) Startup shortcut)' | Out-Null
+    exit 0
+} catch { Set-Content -LiteralPath {ERR} -Value $_.Exception.Message; exit 1 }
+'@
+
+function Get-LastMinerInstallScript([string]$Json,[string]$User) {
+    $lit = { param($s) "'" + ([string]$s).Replace("'","''") + "'" }
+    $psExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $taskArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $lastMinerProtDir 'last-miner.ps1') + '"'
+    return $lastMinerInstall.Replace('{PDIR}',(& $lit $lastMinerProtDir)).Replace('{LAUNCHER}',(& $lit $lastMinerLauncher)).Replace('{JSON}',(& $lit $Json)).
+        Replace('{EXE}',(& $lit $psExe)).Replace('{ARGS}',(& $lit $taskArgs)).Replace('{USER}',(& $lit $User)).Replace('{NAME}',(& $lit $lastMinerTask)).
+        Replace('{ERR}',(& $lit (Join-Path $InstallDir 'agent-task-error.txt')))
+}
+
+function Read-TextOrNull([string]$Path) { try { return [IO.File]::ReadAllText($Path) } catch { return $null } }
+
+function Set-LastMinerShortcut([bool]$Elevated) {
+    $sh = New-Object -ComObject WScript.Shell
+    $l = $sh.CreateShortcut($lastMinerLnk)
+    $psExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $psArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $InstallDir 'last-miner.ps1') + '"'
+    if ($Elevated) {
+        # The elevated task; if Windows refuses to run it, the user-level launcher (its record has no clock or power settings).
+        # The line starts with an unquoted path, so cmd /c keeps every quote in it.
+        $l.TargetPath = Join-Path $env:WINDIR 'System32\cmd.exe'
+        $l.Arguments = '/c ' + (Join-Path $env:WINDIR 'System32\schtasks.exe') + ' /run /tn "' + $lastMinerTask + '" || "' + $psExe + '" ' + $psArgs
+        $l.WindowStyle = 7   # minimized: the launcher's own window shows
+    } else { $l.TargetPath = $psExe; $l.Arguments = $psArgs }
+    $l.WorkingDirectory = $InstallDir
+    $l.Description = 'Pearl: start the miner as it was last started'
+    $l.Save()
+}
+
+# Never throws: the miner is already running when this is called.
+function Save-LastMinerStart($Rec,$PlainRec) {
+    $enc = New-Object Text.UTF8Encoding($false)
+    try {
+        if ($Rec.elevated) {
+            $json = $Rec | ConvertTo-Json -Depth 4
+            $taskOk = $false; try { $taskOk = [bool](Get-ScheduledTask -TaskName $lastMinerTask -ErrorAction Stop) } catch { }
+            # Only a changed start needs the elevated write (from a menu that is not elevated, that is one more Windows prompt).
+            if (-not $taskOk -or (Read-TextOrNull (Join-Path $lastMinerProtDir 'last-miner.json')) -ne $json -or
+                (Read-TextOrNull (Join-Path $lastMinerProtDir 'last-miner.ps1')) -ne $lastMinerLauncher) {
+                if (-not $script:isAdmin -and $script:agentMode) { throw 'needs administrator rights' }
+                if (-not $script:isAdmin) { Write-Host 'Saving this start for the next sign-in needs administrator rights (clock or power settings):' -ForegroundColor Yellow }
+                Invoke-AgentTaskScript (Get-LastMinerInstallScript $json ([Security.Principal.WindowsIdentity]::GetCurrent().Name)) 'save this miner start for the next sign-in'
+            }
+            # The shortcut's fallback when the task cannot run: the same start without clock and power settings.
+            [IO.File]::WriteAllText((Join-Path $InstallDir 'last-miner.ps1'), $lastMinerLauncher, $enc)
+            [IO.File]::WriteAllText((Join-Path $InstallDir 'last-miner.json'), ($PlainRec | ConvertTo-Json -Depth 4), $enc)
+            Set-LastMinerShortcut $true
+            Write-Host "After a restart and sign-in, the shortcut '$(Split-Path $lastMinerLnk -Leaf)' starts this miner again with these settings." -ForegroundColor DarkGray
+            return
+        }
+    } catch {
+        Write-Host "Could not save this start with its clock and power settings for the next sign-in: $($_.Exception.Message)" -ForegroundColor Yellow
+        if ($script:agentMode) { try { Add-AgentError "Saving the miner start for sign-in: $($_.Exception.Message)" } catch { } }
+        Write-Host 'After a restart the shortcut starts the miner WITHOUT clock offsets, locks and power limit.' -ForegroundColor Yellow
+        $Rec = $PlainRec
+    }
+    try {
+        [IO.File]::WriteAllText((Join-Path $InstallDir 'last-miner.ps1'), $lastMinerLauncher, $enc)
+        [IO.File]::WriteAllText((Join-Path $InstallDir 'last-miner.json'), ($Rec | ConvertTo-Json -Depth 4), $enc)
+        Set-LastMinerShortcut $false
+        if (-not $script:agentMode) { Write-Host "After a restart and sign-in, the shortcut '$(Split-Path $lastMinerLnk -Leaf)' starts this miner again." -ForegroundColor DarkGray }
+    } catch {
+        Write-Host "Could not save the miner start for the next sign-in: $($_.Exception.Message)" -ForegroundColor Yellow
+        if ($script:agentMode) { try { Add-AgentError "Saving the miner start for sign-in: $($_.Exception.Message)" } catch { } }
+    }
+}
+
+function Remove-LastMinerShortcut {
+    if (Test-DryRunSkip 'remove the sign-in miner shortcut') { return }
+    try { if (Test-Path -LiteralPath $lastMinerLnk) { Remove-Item -LiteralPath $lastMinerLnk -Force } } catch { }
 }
 
 function ConvertTo-InvariantDouble([string]$s) {
@@ -2880,6 +3066,8 @@ function Complete-AgentTrial {
     Write-AgentLog "Trial run $($script:ag.trial.run_id) passed $([int]($agentTrialConfirmS / 60)) min; saved as last stable." 'Green'
     $script:ag.trial = $null
     Reset-TrialWatch
+    $held = $script:ag.lastMinerHeld; $script:ag.lastMinerHeld = $null
+    if ($held) { Save-LastMinerStart $held[0] $held[1] }   # the trial's miner start is now safe to repeat after a reboot
 }
 
 # Decides what an active trial needs after one tick. Changes only $W, so it can be tested with fake readings.
@@ -3350,7 +3538,7 @@ function Set-MinerWanted([bool]$Wanted,[string]$By = 'local') {
     # The agent keeps a wanted miner running. A deliberate stop (dashboard or menu) clears it so the watchdog and a reboot leave it stopped.
     # $By: 'dashboard' for a dashboard command, so the menu marks the value as set by the server (*ON / *OFF).
     $script:cfg.miner_wanted = $Wanted
-    if (-not $Wanted) { $script:cfg.autostart = $false }
+    if (-not $Wanted) { $script:cfg.autostart = $false; Remove-LastMinerShortcut }   # a stopped rig stays stopped after a reboot
     $script:cfg.miner_wanted_by = $(if ($By -eq 'dashboard') { 'dashboard' } else { '' })
     Save-Config
 }
