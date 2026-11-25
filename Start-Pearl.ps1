@@ -66,7 +66,7 @@ $script:ag = $null           # remote agent state
 
 # power_limit_w: saved power limit in W (0 = leave the driver default); reapplied at every miner start.
 # mem_lock: memory clock lock in MHz (0 = not locked); applied by KRig at miner start like the offsets.
-# core_lock: core clock lock in MHz (0 = not locked; KRig --gpu-cclock); local only, the dashboard does not set it yet.
+# core_lock: core clock lock in MHz (0 = not locked; KRig --gpu-cclock); the dashboard can set it (desired core_lock_mhz), KRig only.
 # server_url / temp_cutoff_c: remote agent (the rig key is stored separately, DPAPI-protected, in agent-key.dat).
 # The GPU settings (config.json key -> report key). A change to one of them made at the rig is kept and sent to the dashboard
 # ("GPU settings changed on the rig itself" below), so Save-Config never writes back a stale copy of them.
@@ -260,9 +260,10 @@ function ConvertTo-MinerArgs([string]$Template,[hashtable]$Values) {
 
 # Which GPU settings the active miner takes: KRig always (flags added by this script); other miners only through their placeholders.
 function Get-ProfileSupport($P,$Miner) {
-    if ((-not $P) -or ($Miner.id -eq 'krig')) { return @{ core=$true; mem=$true; lock=$true } }
+    if ((-not $P) -or ($Miner.id -eq 'krig')) { return @{ core=$true; mem=$true; lock=$true; clock=$true } }
     $a = [string]$P.args
-    return @{ core=($a -match '\{coffset\}'); mem=($a -match '\{moffset\}'); lock=($a -match '\{mclock\}') }
+    # clock = core clock lock: only KRig takes it (--gpu-cclock); no other miner has a placeholder for it yet
+    return @{ core=($a -match '\{coffset\}'); mem=($a -match '\{moffset\}'); lock=($a -match '\{mclock\}'); clock=$false }
 }
 
 function Get-ActiveProfile {
@@ -1403,7 +1404,7 @@ function Show-GpuSettings {
             New-MenuItem '3' 'Core clock offset' (& $star 'core_offset_mhz' ('{0:+#;-#;0} MHz' -f $co)) 'Yellow'
             New-MenuItem '4' 'Memory clock offset' (& $star 'mem_offset_mhz' ('{0:+#;-#;0} MHz' -f $mo)) 'Yellow'
             New-MenuItem 'L' 'Memory clock lock' (& $star 'mem_lock_mhz' (Format-MemLock $ml)) 'Yellow'
-            New-MenuItem 'K' 'Core clock lock' (Format-MemLock $cl) 'Yellow'
+            New-MenuItem 'K' 'Core clock lock' (& $star 'core_lock_mhz' (Format-MemLock $cl)) 'Yellow'
             New-MenuItem '5' 'Clear offsets and both locks'
             New-MenuItem '6' 'Offset limits' ('core {0}..{1}  mem {2}..{3}' -f [int]$script:cfg.core_min,[int]$script:cfg.core_max,[int]$script:cfg.mem_min,[int]$script:cfg.mem_max) 'DarkGray'
             New-MenuHeader 'Fans'
@@ -2630,12 +2631,12 @@ function Get-MinerStartOffsets([int]$MinerPid) {
     # PROTOCOL rule 1 compares against the offsets the running miner was started with: its command line is the truth.
     $c = $script:ag.offsetCache
     if ($c -and $c.pid -eq $MinerPid) { return $c }
-    $r = @{ pid=$MinerPid; core=[int]$script:cfg.core_offset; mem=[int]$script:cfg.mem_offset; mlock=[int]$script:cfg.mem_lock; source='config' }
+    $r = @{ pid=$MinerPid; core=[int]$script:cfg.core_offset; mem=[int]$script:cfg.mem_offset; mlock=[int]$script:cfg.mem_lock; clock=[int]$script:cfg.core_lock; source='config' }
     $mi = Get-ActiveMiner
     if ($mi.id -ne 'krig') {
         # Another miner's flags cannot be parsed back: it got exactly the saved values its template takes, and 0 for the rest.
         $sup = Get-ProfileSupport (Get-ActiveProfile) $mi
-        if (-not $sup.core) { $r.core = 0 }; if (-not $sup.mem) { $r.mem = 0 }; if (-not $sup.lock) { $r.mlock = 0 }
+        if (-not $sup.core) { $r.core = 0 }; if (-not $sup.mem) { $r.mem = 0 }; if (-not $sup.lock) { $r.mlock = 0 }; if (-not $sup.clock) { $r.clock = 0 }
         $r.source = 'profile'
         $script:ag.offsetCache = $r
         return $r
@@ -2643,10 +2644,11 @@ function Get-MinerStartOffsets([int]$MinerPid) {
     try {
         $cl = [string](Get-CimInstance Win32_Process -Filter "ProcessId=$MinerPid" -ErrorAction Stop).CommandLine
         if ($cl) {
-            $r.core = 0; $r.mem = 0; $r.mlock = 0; $r.source = 'command line'
+            $r.core = 0; $r.mem = 0; $r.mlock = 0; $r.clock = 0; $r.source = 'command line'
             if ($cl -match '--gpu-coffset[= ]\+?(-?\d+)') { $r.core = [int]$Matches[1] }
             if ($cl -match '--gpu-moffset[= ]\+?(-?\d+)') { $r.mem = [int]$Matches[1] }
             if ($cl -match '--gpu-mclock[= ](\d+)') { $r.mlock = [int]$Matches[1] }
+            if ($cl -match '--gpu-cclock[= ](\d+)') { $r.clock = [int]$Matches[1] }
         }
     } catch { }
     $script:ag.offsetCache = $r
@@ -2656,13 +2658,13 @@ function Get-MinerStartOffsets([int]$MinerPid) {
 # ---- Settings: actual, target (clamped), compare, apply ----
 function Copy-Settings($S) {
     return @{ power_limit_w=$S.power_limit_w; core_offset_mhz=$S.core_offset_mhz; mem_offset_mhz=$S.mem_offset_mhz; mem_lock_mhz=[int]$S.mem_lock_mhz
-              fan_mode=$S.fan_mode; fan_percent=$S.fan_percent }
+              core_lock_mhz=[int]$S.core_lock_mhz; fan_mode=$S.fan_mode; fan_percent=$S.fan_percent }
 }
 
 function Format-AgentSettings($S) {
     $fan = [string]$S.fan_mode
     if ($S.fan_mode -eq 'manual') { $fan += " $($S.fan_percent)%" }
-    return "power $($S.power_limit_w) W, core $($S.core_offset_mhz), mem $($S.mem_offset_mhz), mem lock $(Format-MemLock ([int]$S.mem_lock_mhz)), fans $fan"
+    return "power $($S.power_limit_w) W, core $($S.core_offset_mhz), mem $($S.mem_offset_mhz), mem lock $(Format-MemLock ([int]$S.mem_lock_mhz)), core lock $(Format-MemLock ([int]$S.core_lock_mhz)), fans $fan"
 }
 
 function Get-AgentActual([switch]$Real) {
@@ -2671,11 +2673,11 @@ function Get-AgentActual([switch]$Real) {
     if ($script:isDryRun -and -not $Real) { return (Copy-Settings $script:ag.sim) }
     $pl = $null
     if ($script:ag.smi) { $pl = ConvertTo-NullableInt $script:ag.smi.power_limit_w }
-    $co = [int]$script:cfg.core_offset; $mo = [int]$script:cfg.mem_offset; $ml = [int]$script:cfg.mem_lock
-    if ($script:ag.miner.running) { $o = Get-MinerStartOffsets $script:ag.miner.pid; $co = $o.core; $mo = $o.mem; $ml = [int]$o.mlock }
+    $co = [int]$script:cfg.core_offset; $mo = [int]$script:cfg.mem_offset; $ml = [int]$script:cfg.mem_lock; $cl = [int]$script:cfg.core_lock
+    if ($script:ag.miner.running) { $o = Get-MinerStartOffsets $script:ag.miner.pid; $co = $o.core; $mo = $o.mem; $ml = [int]$o.mlock; $cl = [int]$o.clock }
     $fm = [string]$script:cfg.fan_mode
     if ($fm -notin @('auto','manual','curve','external')) { $fm = 'auto' }
-    return @{ power_limit_w=$pl; core_offset_mhz=$co; mem_offset_mhz=$mo; mem_lock_mhz=$ml; fan_mode=$fm; fan_percent=[int]$script:cfg.fan_percent }
+    return @{ power_limit_w=$pl; core_offset_mhz=$co; mem_offset_mhz=$mo; mem_lock_mhz=$ml; core_lock_mhz=$cl; fan_mode=$fm; fan_percent=[int]$script:cfg.fan_percent }
 }
 
 function Get-AgentLimits {
@@ -2704,12 +2706,14 @@ function Get-AgentTarget($Desired,$Current,$Limits,$Support = $null) {
         if (-not $Support.core -and $null -ne $Desired.core_offset_mhz -and [int]$Desired.core_offset_mhz -ne [int]$Current.core_offset_mhz) { $skip += 'core offset' }
         if (-not $Support.mem -and $null -ne $Desired.mem_offset_mhz -and [int]$Desired.mem_offset_mhz -ne [int]$Current.mem_offset_mhz) { $skip += 'memory offset' }
         if (-not $Support.lock -and $null -ne $Desired.mem_lock_mhz -and [int]$Desired.mem_lock_mhz -ne [int]$Current.mem_lock_mhz) { $skip += 'memory lock' }
+        if (-not $Support.clock -and $null -ne $Desired.core_lock_mhz -and [int]$Desired.core_lock_mhz -ne [int]$Current.core_lock_mhz) { $skip += 'core lock' }
         if ($skip.Count) { [void]$notes.Add(($skip -join ', ') + ' not supported by the profile''s miner (no placeholder); left as is') }
         $d = @{}
-        foreach ($k in @('power_limit_w','core_offset_mhz','mem_offset_mhz','mem_lock_mhz','fan_mode','fan_percent')) { $d[$k] = $Desired.$k }
+        foreach ($k in @('power_limit_w','core_offset_mhz','mem_offset_mhz','mem_lock_mhz','core_lock_mhz','fan_mode','fan_percent')) { $d[$k] = $Desired.$k }
         if (-not $Support.core) { $d.core_offset_mhz = $null }
         if (-not $Support.mem) { $d.mem_offset_mhz = $null }
         if (-not $Support.lock) { $d.mem_lock_mhz = $null }
+        if (-not $Support.clock) { $d.core_lock_mhz = $null }
         $Desired = $d
     }
     if ($null -ne $Desired.power_limit_w) {
@@ -2728,6 +2732,13 @@ function Get-AgentTarget($Desired,$Current,$Limits,$Support = $null) {
         if ($null -eq $ml) { [void]$notes.Add('memory lock ignored: not a number') }
         elseif ($ml -le 0) { $t.mem_lock_mhz = 0 }
         else { $t.mem_lock_mhz = Limit-Setting $ml $memLockMin $memLockMax 'memory lock' $notes }
+    }
+    # Core lock, the same way (KRig only; --gpu-cclock).
+    if ($null -ne $Desired.core_lock_mhz) {
+        $cl = ConvertTo-NullableInt $Desired.core_lock_mhz
+        if ($null -eq $cl) { [void]$notes.Add('core lock ignored: not a number') }
+        elseif ($cl -le 0) { $t.core_lock_mhz = 0 }
+        else { $t.core_lock_mhz = Limit-Setting $cl $coreLockMin $coreLockMax 'core lock' $notes }
     }
     $fm = $Desired.fan_mode
     if ($Current.fan_mode -eq 'external') { }   # fans belong to the FanControl app: server fan settings are ignored
@@ -2752,6 +2763,7 @@ function Compare-AgentSettings($Want,$Have) {
     if ([int]$Want.core_offset_mhz -ne [int]$Have.core_offset_mhz) { $d += 'core_offset_mhz' }
     if ([int]$Want.mem_offset_mhz -ne [int]$Have.mem_offset_mhz) { $d += 'mem_offset_mhz' }
     if ([int]$Want.mem_lock_mhz -ne [int]$Have.mem_lock_mhz) { $d += 'mem_lock_mhz' }
+    if ([int]$Want.core_lock_mhz -ne [int]$Have.core_lock_mhz) { $d += 'core_lock_mhz' }
     if ([string]$Want.fan_mode -ne [string]$Have.fan_mode) { $d += 'fan_mode' }
     elseif ($Want.fan_mode -eq 'manual' -and [int]$Want.fan_percent -ne [int]$Have.fan_percent) { $d += 'fan_percent' }
     return $d
@@ -2881,7 +2893,7 @@ function Invoke-AgentApply($T,[string]$Why) {
     $diff = @(Compare-AgentSettings $T $have)
     if ($diff.Count -eq 0) { return $false }
     Write-AgentLog "Applying ${Why}: $(Format-AgentSettings $T) (was: $(Format-AgentSettings $have))" 'Yellow'
-    $offsets = ($diff -contains 'core_offset_mhz') -or ($diff -contains 'mem_offset_mhz') -or ($diff -contains 'mem_lock_mhz')
+    $offsets = ($diff -contains 'core_offset_mhz') -or ($diff -contains 'mem_offset_mhz') -or ($diff -contains 'mem_lock_mhz') -or ($diff -contains 'core_lock_mhz')
     if ($script:isDryRun) {
         foreach ($k in $diff) { Write-AgentLog "DRY-RUN would change ${k}: $($have[$k]) -> $($T[$k])" 'Magenta' }
         if ($offsets -and $script:ag.miner.running) { Write-AgentLog 'DRY-RUN would restart the miner to apply the clock offsets.' 'Magenta' }
@@ -2898,7 +2910,7 @@ function Invoke-AgentApply($T,[string]$Why) {
         $changes.fan_mode = [string]$T.fan_mode
         if ($T.fan_mode -eq 'manual') { $changes.fan_percent = [int]$T.fan_percent }
     }
-    if ($offsets) { $changes.core_offset = [int]$T.core_offset_mhz; $changes.mem_offset = [int]$T.mem_offset_mhz; $changes.mem_lock = [int]$T.mem_lock_mhz }
+    if ($offsets) { $changes.core_offset = [int]$T.core_offset_mhz; $changes.mem_offset = [int]$T.mem_offset_mhz; $changes.mem_lock = [int]$T.mem_lock_mhz; $changes.core_lock = [int]$T.core_lock_mhz }
     Update-AgentConfig $changes
     if ($changes.Contains('fan_mode')) { Update-AgentFans -Force }
     if ($offsets -and $script:ag.miner.running) { Restart-AgentMiner 'new clock offsets' }
@@ -3058,7 +3070,7 @@ function Add-AgentBlocked($Rev) {
 function New-AgentSnapshot {
     $s = Get-AgentActual
     return [ordered]@{ revision=$script:ag.mem.revision; run_id=$script:ag.mem.run_id; power_limit_w=$s.power_limit_w
-        core_offset_mhz=$s.core_offset_mhz; mem_offset_mhz=$s.mem_offset_mhz; mem_lock_mhz=$s.mem_lock_mhz; fan_mode=$s.fan_mode; fan_percent=$s.fan_percent; saved_at=(Get-UnixNow) }
+        core_offset_mhz=$s.core_offset_mhz; mem_offset_mhz=$s.mem_offset_mhz; mem_lock_mhz=$s.mem_lock_mhz; core_lock_mhz=$s.core_lock_mhz; fan_mode=$s.fan_mode; fan_percent=$s.fan_percent; saved_at=(Get-UnixNow) }
 }
 
 function Reset-TrialWatch { $script:ag.watch = @{ hrBadSince=$null; hot=0; okS=0.0 } }
@@ -4109,7 +4121,7 @@ function Complete-AgentReport {
         if ($resp) {
             # What the dashboard controls right now (the menu marks those values with *): desired fields that are set, and a profile.
             $managed = @()
-            if ($resp.desired) { foreach ($k in @('power_limit_w','core_offset_mhz','mem_offset_mhz','mem_lock_mhz','fan_mode')) { if ($null -ne $resp.desired.$k) { $managed += $k } } }
+            if ($resp.desired) { foreach ($k in @('power_limit_w','core_offset_mhz','mem_offset_mhz','mem_lock_mhz','core_lock_mhz','fan_mode')) { if ($null -ne $resp.desired.$k) { $managed += $k } } }
             if ($resp.PSObject.Properties.Name -contains 'profile' -and $null -ne $resp.profile) { $managed += 'profile' }
             $script:ag.managed = $managed
             try { Invoke-AgentReconcile $resp } catch { Add-AgentError "Reconcile: $($_.Exception.Message)" }
