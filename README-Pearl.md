@@ -1,6 +1,6 @@
 # Pearl-POW / PRL miner for Windows 11 (one RTX 4090 per PC)
 
-A menu-driven launcher for KRig 1.5.9 mining PRL on the Kryptex pool, paid out in BTC. The miner runs in its own console window; the menu is only a control panel, so closing the menu never stops mining. **Nothing starts automatically** unless you turn on option 6.
+A menu-driven launcher for KRig 1.8.2 mining PRL on the Kryptex pool, paid out in BTC. The miner runs in its own console window; the menu is only a control panel, so closing the menu never stops mining. **Nothing starts automatically** unless you turn on option 6.
 
 ## Quick start
 
@@ -85,7 +85,7 @@ Worker, mode and run label given on the command line apply to that start; the us
 Everything lives in `%LOCALAPPDATA%\PearlMining` (or `-InstallDir`):
 
 - `config.json`: Kryptex username, mode, startup/auto-start flags, earnings yield, API port, clock offsets.
-- `krig-1.5.9\`: the miner, plus `verified-exe.sha256` recorded after extraction.
+- `krig-1.8.2\`: the miner, plus `verified-exe.sha256` recorded after extraction.
 - `logs\<timestamp>-<mode>-<worker>-<label>\miner.log` and `session.json` for each miner start. Logs may contain your public mining username and connection details; redact before sharing. Logs are kept until you delete them.
 
 ## Updating the script (option 9)
@@ -96,7 +96,7 @@ Only `Start-Pearl.ps1` is updated; the `.cmd` launchers rarely change.
 
 ## Security notes
 
-- The miner download is pinned to SHA-256 `48503c5503f5e673fdafb18647982e674381ec5c719fa2c4ac6165e718b0af4f`, checked before extraction. The extracted exe's hash is recorded and re-checked on every start. This detects file changes; it does not protect against a compromised local account.
+- The miner download is pinned to SHA-256 `c82155840127270abf9a41c8129a9e3d4559c32a6224982e86b39cafdc6663c4`, checked before extraction. The extracted exe's hash is recorded and re-checked on every start. This detects file changes; it does not protect against a compromised local account.
 - The miner's HTTP API listens on `127.0.0.1:12000` only.
 - Option 9 runs whatever is on the repository's `main` branch, and updates are checked for syntax, not signed. Anyone who can push to the repository controls what runs on your PCs; protect the GitHub account with two-factor authentication.
 - Options 5 and 6 add a Startup-folder shortcut (turn off option 5 to remove it). The launchers use `-ExecutionPolicy Bypass` for this script only.

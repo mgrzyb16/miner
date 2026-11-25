@@ -3,7 +3,7 @@
    Interactive menu: start/stop the miner, live summary, optional Windows startup.
    The miner runs in its own console window; closing this menu never stops it.
    Auto-start is switched on in menu S (System & auto-start); a started miner also comes back after a restart (see below).
-   Downloads KRig 1.5.9 from its publisher and verifies the pinned SHA-256.
+   Downloads KRig 1.8.2 from its publisher and verifies the pinned SHA-256.
    Does not change GPU tuning, antivirus, firewall, or power settings.
    Options 5/6 create (or remove) one shortcut in your per-user Startup folder.
    Every miner start also writes 'Pearl Miner (last start)' there: it repeats that start after a sign-in unless a miner already
@@ -41,8 +41,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$version = '1.5.9'
-$archiveHash = '48503c5503f5e673fdafb18647982e674381ec5c719fa2c4ac6165e718b0af4f'
+$version = '1.8.2'
+$archiveHash = 'c82155840127270abf9a41c8129a9e3d4559c32a6224982e86b39cafdc6663c4'
 $url = "https://github.com/kryptex/krig-miner/releases/download/v$version/krig-miner-$version-win-x64.zip"
 $pool = 'stratum+ssl://prl-eu.kryptex.network:8048'
 $configFile = Join-Path $InstallDir 'config.json'
