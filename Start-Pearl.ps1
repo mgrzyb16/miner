@@ -3,7 +3,7 @@
    Interactive menu: start/stop the miner, live summary, optional Windows startup.
    The miner runs in its own console window; closing this menu never stops it.
    Auto-start is switched on in menu S (System & auto-start); a started miner also comes back after a restart (see below).
-   Downloads KRig 1.8.2 from its publisher and verifies the pinned SHA-256.
+   Downloads KRig 1.5.9 from its publisher and verifies the pinned SHA-256.
    Does not change GPU tuning, antivirus, firewall, or power settings.
    Options 5/6 create (or remove) one shortcut in your per-user Startup folder.
    Every miner start also writes 'Pearl Miner (last start)' there: it repeats that start after a sign-in unless a miner already
@@ -41,8 +41,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$version = '1.8.2'
-$archiveHash = 'c82155840127270abf9a41c8129a9e3d4559c32a6224982e86b39cafdc6663c4'
+$version = '1.5.9'
+$archiveHash = '48503c5503f5e673fdafb18647982e674381ec5c719fa2c4ac6165e718b0af4f'
 $url = "https://github.com/kryptex/krig-miner/releases/download/v$version/krig-miner-$version-win-x64.zip"
 $pool = 'stratum+ssl://prl-eu.kryptex.network:8048'
 $configFile = Join-Path $InstallDir 'config.json'
@@ -145,6 +145,13 @@ function Invoke-Smi([string]$Query) {
 
 function Install-Miner {
     if (Test-DryRunSkip 'install or verify the miner') { return }
+    # A KRig release approved from the dashboard: run exactly that exe, checked against its administrator-written SHA-256.
+    $k = (Get-ApprovedMiners)[0]
+    if ($k.sha256) {
+        if (-not (Test-Path -LiteralPath $k.exe)) { throw "the approved KRig is missing: $($k.exe). Install it again from the dashboard." }
+        if ((Get-FileHash -LiteralPath $k.exe -Algorithm SHA256).Hash -ne $k.sha256) { throw "the approved KRig changed since it was approved (SHA-256 differs): $($k.exe)" }
+        return $k.exe
+    }
     $binaryDir = Join-Path $InstallDir "krig-$version"
     $exe = Join-Path $binaryDir 'krig-miner.exe'
     $manifest = Join-Path $binaryDir 'verified-exe.sha256'
@@ -203,8 +210,14 @@ function Get-ApprovedMiners {
     foreach ($e in @(Read-JsonFile $minersFile)) {
         if ($null -eq $e) { continue }
         $id = [string]$e.id; $exe = [string]$e.exe; $sha = [string]$e.sha256; $st = [string]$e.stats
-        if ($id -notmatch '^[a-z0-9][a-z0-9_.-]{0,31}$' -or $id -eq 'krig') { continue }
+        if ($id -notmatch '^[a-z0-9][a-z0-9_.-]{0,31}$') { continue }
         if (-not [IO.Path]::IsPathRooted($exe) -or $exe -notmatch '\.exe$' -or $sha -notmatch '^[0-9A-Fa-f]{64}$') { continue }
+        if ($id -eq 'krig') {
+            # A KRig release installed from the dashboard (or menu M) replaces the built-in fallback; its exe is pinned by SHA-256.
+            if ([IO.Path]::GetFileName($exe) -ine 'krig-miner.exe') { continue }
+            $k = $list[0]; $k.exe = $exe; $k.sha256 = $sha.ToUpperInvariant(); $k.name = (Limit-Text ([string]$e.name) 64)
+            continue
+        }
         if ($st -notin @('krig','none')) { $st = 'none' }
         [void]$list.Add([ordered]@{ id=$id; name=(Limit-Text ([string]$e.name) 64); exe=$exe; sha256=$sha.ToUpperInvariant()
             process=[IO.Path]::GetFileNameWithoutExtension($exe); stats=$st })
@@ -1932,6 +1945,9 @@ $minerSources = [ordered]@{
     'rgminer'      = @{ name='RGMiner';             repo='Printscan/rgminer';         asset='^rgminer-[0-9.]+-windows\.zip$';                 exe='rgminer.exe' }
     'fl4shminer'   = @{ name='Fl4shMiner';          repo='Fl4sh9174/Fl4shMiner';      asset='^fl4shminer-v[0-9.]+-windows-amd64\.zip$';       exe='fl4shminer.exe' }
     'pearlfortune' = @{ name='Pearl Fortune miner'; repo='pearlfortune/pearl-miner';  asset='^miner-windows-v[0-9.]+\.zip$';                  exe='miner.exe' }
+    # KRig: the version the script pins above is only the fallback. Installing KRig from here (dashboard "Install on rigs", or menu M)
+    # approves that release's exe in miners.json under id 'krig', and Get-ApprovedMiners then runs it instead of the fallback.
+    'krig'         = @{ name='KRig';                repo='kryptex/krig-miner';        asset='^krig-miner-[0-9.]+-win-x64\.zip$';              exe='krig-miner.exe' }
 }
 $minersRoot = Join-Path $InstallDir 'miners'
 
@@ -2044,8 +2060,10 @@ function Get-ManagedMinerVersion($Miner) {
 # One elevated write for several miners (one Windows prompt): $Set = @(@{ id; name; exe }).
 function Set-ApprovedMinersBatch($Set) {
     $ids = @($Set | ForEach-Object { $_.id })
-    $extra = @(Get-ApprovedMiners | Where-Object { $_.id -ne 'krig' -and $ids -notcontains $_.id })
-    $new = @($Set | ForEach-Object { [ordered]@{ id=$_.id; name=$_.name; exe=$_.exe; sha256=(Get-FileHash -LiteralPath $_.exe -Algorithm SHA256).Hash; stats='none' } })
+    # The built-in KRig has no sha256; one approved from a release has, and is kept.
+    $extra = @(Get-ApprovedMiners | Where-Object { ($_.id -ne 'krig' -or $_.sha256) -and $ids -notcontains $_.id })
+    $new = @($Set | ForEach-Object { [ordered]@{ id=$_.id; name=$_.name; exe=$_.exe; sha256=(Get-FileHash -LiteralPath $_.exe -Algorithm SHA256).Hash
+                                                 stats=$(if ($_.id -eq 'krig') { 'krig' } else { 'none' }) } })
     Save-ApprovedMiners (@($extra) + $new)
 }
 
@@ -3934,8 +3952,8 @@ function Invoke-RigCheck {
     }
     # Account and miner
     if ([string]$script:cfg.mining_username -match '^krx[A-Za-z0-9]+$') { & $add 'PASS' 'Kryptex username' 'saved' } else { & $add 'FAIL' 'Kryptex username' 'not saved: the miner cannot start unattended (Setup needs -MiningUsername krx...)' }
-    $exe = Join-Path $InstallDir "krig-$version\krig-miner.exe"
-    if (Test-Path -LiteralPath $exe) { & $add 'PASS' 'Miner binary' "krig-miner $version installed" } else { & $add 'WARN' 'Miner binary' 'not downloaded yet (Setup downloads and verifies it)' }
+    $km = (Get-ApprovedMiners)[0]; $exe = $km.exe
+    if (Test-Path -LiteralPath $exe) { & $add 'PASS' 'Miner binary' "$($km.name) installed" } else { & $add 'WARN' 'Miner binary' 'not downloaded yet (Setup downloads and verifies it)' }
     # Agent
     if (Test-AgentTask) { & $add 'PASS' 'Agent task' 'registered' } else { & $add 'WARN' 'Agent task' 'not registered (Setup registers it)' }
     $hb = Get-AgentHeartbeat
